@@ -1,0 +1,6 @@
+# GitHub rejects files over 100 MB. The server binaries stay on the host.
+bin/mongod
+bin/mongos
+# Wrapper built by the Mercury cmake build, and the data directory it creates.
+/mongod
+/27017/
