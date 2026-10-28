@@ -1,0 +1,7 @@
+#!/bin/sh
+# Mercury execs this through a link named after the service. The services open config/ relative to the working
+# directory, so run from run/ (where standalone_config.py writes the standalone config), with the binaries from ../bin.
+here=$(CDPATH= cd "$(dirname "$0")" && pwd)
+name=$(basename "$0")
+cd "$here" || exit 1
+exec "$here/../bin/$name" "$@"

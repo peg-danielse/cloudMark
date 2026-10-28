@@ -1,0 +1,23 @@
+# Written by scripts/standalone_config.py: the config, the data dirs and the links Mercury execs.
+config/
+data/
+11300
+11301
+11302
+11303
+11304
+11305
+11306
+CastInfoService
+ComposeReviewService
+MovieIdService
+MovieInfoService
+MovieReviewService
+PageService
+PlotService
+RatingService
+ReviewStorageService
+TextService
+UniqueIdService
+UserReviewService
+UserService

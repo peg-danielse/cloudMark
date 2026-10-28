@@ -1,0 +1,5 @@
+#!/bin/sh
+# MongoDB on 27018, so the media data does not share a data directory with the social network (27017). The wrapper
+# keeps its data in runtime/mongodb/<port>/db. Mercury execs this with no arguments.
+here=$(CDPATH= cd "$(dirname "$0")" && pwd)
+exec "$here/../../runtime/mongodb/mongod" --advertise-port 27018 "$@"

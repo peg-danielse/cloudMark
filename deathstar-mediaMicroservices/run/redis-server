@@ -1,0 +1,5 @@
+#!/bin/sh
+# Redis on 6379. Its dump.rdb lives in run/data/redis, so the seeded state is restored by copying the dump there.
+here=$(CDPATH= cd "$(dirname "$0")" && pwd)
+cd "$here/data/redis" || exit 1
+exec "$here/../../runtime/redis/redis-server" "$@"
