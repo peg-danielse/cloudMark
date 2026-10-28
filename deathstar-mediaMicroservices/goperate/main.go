@@ -45,8 +45,8 @@ const (
 	defaultProcs  = 16
 )
 
-// benchmarksRoot is the benchmarks directory: the parent of deathstar-mediaMicroservices, where mercury-media.txt and
-// the runtime stores live.
+// benchmarksRoot is the benchmarks directory that holds mercury-media.txt and the runtime stores:
+// the parent of mediaRoot (this checkout when DSB_ROOT and MEDIA_ROOT are unset).
 func benchmarksRoot() string { return filepath.Dir(mediaRoot()) }
 
 // clientOpts is everything the run command needs besides the load itself.

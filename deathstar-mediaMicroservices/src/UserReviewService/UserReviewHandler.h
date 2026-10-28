@@ -157,27 +157,26 @@ void UserReviewHandler::UploadUserReview(
   mongoc_collection_destroy(collection);
   mongoc_client_pool_push(_mongodb_client_pool, mongodb_client);
 
-  auto redis_client_wrapper = _redis_client_pool->Pop();
-  if (!redis_client_wrapper) {
+  RedisCheckout redis_held(_redis_client_pool);
+  redis_held.reset(_redis_client_pool->Pop());
+  if (!redis_held.client()) {
     ServiceException se;
     se.errorCode = ErrorCode::SE_REDIS_ERROR;
     se.message = "Cannot connected to Redis server";
     throw se;
   }
-  auto redis_client = redis_client_wrapper->GetClient();
+  auto redis_client = redis_held.redis();
   auto redis_span = opentracing::Tracer::Global()->StartSpan(
       "RedisUpdate", {opentracing::ChildOf(&span->context())});
   auto num_reviews = redis_client->zcard(std::to_string(user_id));
-  redis_client->sync_commit();
-  auto num_reviews_reply = num_reviews.get();
+  auto num_reviews_reply = RedisSyncCommit(redis_held, num_reviews);
   std::vector<std::string> options{"NX"};
   if (num_reviews_reply.ok() && num_reviews_reply.as_integer()) {
     std::multimap<std::string, std::string> value = {{
       std::to_string(timestamp), std::to_string(review_id)}};
-    redis_client->zadd(std::to_string(user_id), options, value);
-    redis_client->sync_commit();
+    auto added = redis_client->zadd(std::to_string(user_id), options, value);
+    RedisSyncCommit(redis_held, added);
   }
-  _redis_client_pool->Push(redis_client_wrapper);
   redis_span->Finish();
   span->Finish();
 }
@@ -201,14 +200,15 @@ void UserReviewHandler::ReadUserReviews(
     return;
   }
 
-  auto redis_client_wrapper = _redis_client_pool->Pop();
-  if (!redis_client_wrapper) {
+  RedisCheckout redis_held(_redis_client_pool);
+  redis_held.reset(_redis_client_pool->Pop());
+  if (!redis_held.client()) {
     ServiceException se;
     se.errorCode = ErrorCode::SE_REDIS_ERROR;
     se.message = "Cannot connected to Redis server";
     throw se;
   }
-  auto redis_client = redis_client_wrapper->GetClient();
+  auto redis_client = redis_held.redis();
   auto redis_span = opentracing::Tracer::Global()->StartSpan(
       "RedisFind", {opentracing::ChildOf(&span->context())});
   auto review_ids_future = redis_client->zrevrange(
@@ -218,18 +218,17 @@ void UserReviewHandler::ReadUserReviews(
 
   cpp_redis::reply review_ids_reply;
   try {
-    review_ids_reply = review_ids_future.get();
+    review_ids_reply = RedisWait(redis_held, review_ids_future);
   } catch (...) {
     LOG(error) << "Failed to read review_ids from user-review-redis";
-    _redis_client_pool->Push(redis_client_wrapper);
     throw;
   }
-  _redis_client_pool->Push(redis_client_wrapper);
   std::vector<int64_t> review_ids;
   auto review_ids_reply_array = review_ids_reply.as_array();
   for (auto &review_id_reply : review_ids_reply_array) {
     review_ids.emplace_back(std::stoul(review_id_reply.as_string()));
   }
+  redis_held.reset(nullptr);
 
   int mongo_start = start + review_ids.size();
   std::multimap<std::string, std::string> redis_update_map;
@@ -326,23 +325,24 @@ void UserReviewHandler::ReadUserReviews(
       });
 
   std::future<cpp_redis::reply> zadd_reply_future;
+  RedisCheckout redis_update(_redis_client_pool);
   if (!redis_update_map.empty()) {
     // Update Redis
-    redis_client_wrapper = _redis_client_pool->Pop();
-    if (!redis_client_wrapper) {
+    redis_update.reset(_redis_client_pool->Pop());
+    if (!redis_update.client()) {
       ServiceException se;
       se.errorCode = ErrorCode::SE_REDIS_ERROR;
       se.message = "Cannot connected to Redis server";
       throw se;
     }
-    redis_client = redis_client_wrapper->GetClient();
+    auto* update_client = redis_update.redis();
     auto redis_update_span = opentracing::Tracer::Global()->StartSpan(
         "RedisUpdate", {opentracing::ChildOf(&span->context())});
-    redis_client->del(std::vector<std::string>{std::to_string(user_id)});
+    update_client->del(std::vector<std::string>{std::to_string(user_id)});
     std::vector<std::string> options{"NX"};
-    zadd_reply_future = redis_client->zadd(
+    zadd_reply_future = update_client->zadd(
         std::to_string(user_id), options, redis_update_map);
-    redis_client->commit();
+    update_client->commit();
     redis_update_span->Finish();
   }
 
@@ -350,26 +350,23 @@ void UserReviewHandler::ReadUserReviews(
     _return = review_future.get();
   } catch (...) {
     LOG(error) << "Failed to get review from review-storage-service";
-    if (!redis_update_map.empty()) {
+    if (redis_update.client()) {
       try {
-        zadd_reply_future.get();
+        RedisWait(redis_update, zadd_reply_future);
       } catch (...) {
         LOG(error) << "Failed to Update Redis Server";
       }
-      _redis_client_pool->Push(redis_client_wrapper);
     }
     throw;
   }
 
-  if (!redis_update_map.empty()) {
+  if (redis_update.client()) {
     try {
-      zadd_reply_future.get();
+      RedisWait(redis_update, zadd_reply_future);
     } catch (...) {
       LOG(error) << "Failed to Update Redis Server";
-      _redis_client_pool->Push(redis_client_wrapper);
       throw;
     }
-    _redis_client_pool->Push(redis_client_wrapper);
   }
 
   span->Finish();

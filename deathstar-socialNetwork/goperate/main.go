@@ -1,7 +1,7 @@
 // Command goperate drives the DeathStarBench social network under Mercury,
 // mirroring deathstar-hotelReservations/operate.
 //
-// Mercury is started separately (sudo ~/Mercury/build/mercury 8080). The
+// Mercury is started separately (this repository's build/mercury). The
 // services are the C++ Thrift binaries in ../bin, launched through ../run/
 // so they find config/service-config.json. There is no nginx front end; the
 // load generator speaks Thrift (framed, binary) to the services directly.

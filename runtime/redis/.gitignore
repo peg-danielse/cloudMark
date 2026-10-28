@@ -1,4 +1,6 @@
 # Wrapper built by the Mercury cmake build.
 /redis-server
+# Optional server built beside the wrapper when /usr/bin/redis-server cannot run.
+/local/
 # The redis data directory (dump.rdb), created by the wrapper at run time.
 /6379/

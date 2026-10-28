@@ -75,21 +75,30 @@ void RatingHandler::UploadRating(
   });
 
   redis_future = std::async(std::launch::async, [&](){
-    auto redis_client_wrapper = _redis_client_pool->Pop();
-    if (!redis_client_wrapper) {
+    RedisCheckout redis_held(_redis_client_pool);
+    redis_held.reset(_redis_client_pool->Pop());
+    if (!redis_held.client()) {
       ServiceException se;
       se.errorCode = ErrorCode::SE_REDIS_ERROR;
       se.message = "Cannot connected to Redis server";
       throw se;
     }
-    auto redis_client = redis_client_wrapper->GetClient();
+    auto redis_client = redis_held.redis();
     auto redis_span = opentracing::Tracer::Global()->StartSpan(
         "RedisInsert", {opentracing::ChildOf(&span->context())});
-    redis_client->incrby(movie_id + ":uncommit_sum", rating);
-    redis_client->incr(movie_id + ":uncommit_num");
-    redis_client->sync_commit();
+    auto sum = redis_client->incrby(movie_id + ":uncommit_sum", rating);
+    auto num = redis_client->incr(movie_id + ":uncommit_num");
+    redis_client->sync_commit(kRedisRoundTripTimeout);
+    if (sum.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready ||
+        num.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+      redis_span->Finish();
+      redis_held.client()->Disconnect();
+      sum.wait_for(std::chrono::milliseconds(50));
+      num.wait_for(std::chrono::milliseconds(50));
+      redis_held.discard();
+      ThrowRedisTimeout("Redis sync_commit timed out");
+    }
     redis_span->Finish();
-    _redis_client_pool->Push(redis_client_wrapper);
   });
 
   try {

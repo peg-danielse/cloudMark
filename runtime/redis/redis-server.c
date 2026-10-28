@@ -8,7 +8,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static const char *kServer = "/usr/bin/redis-server";
+static char kServer[PATH_MAX];
 static char kRoot[PATH_MAX];
 static const int kDefaultPort = 6379;
 
@@ -25,6 +25,11 @@ static void init_paths(void) {
     *slash = '\0';
   }
   snprintf(kRoot, sizeof kRoot, "%s", path);
+  // A server built beside this wrapper wins. The system binary is the fallback.
+  snprintf(kServer, sizeof kServer, "%s/local/bin/redis-server", kRoot);
+  if (access(kServer, X_OK) != 0) {
+    snprintf(kServer, sizeof kServer, "/usr/bin/redis-server");
+  }
 }
 
 static int parse_port(const char *text) {

@@ -147,7 +147,21 @@ def plan_perturbation(kind, d, partner, cpus, mercury_cpu, allowed):
     raise SystemExit("unknown kind " + kind)
 
 
-STRESS_NG = os.environ.get("STRESS_NG", os.path.expanduser("~/Benchmarks/stress-ng/stress-ng"))
+def _stress_ng():
+    # The binary cmake builds. STRESS_NG overrides; DSB_ROOT selects another benchmarks tree.
+    env = os.environ.get("STRESS_NG")
+    if env:
+        return env
+    root = os.environ.get("DSB_ROOT")
+    if root:
+        candidate = os.path.join(root, "stress-ng", "stress-ng")
+        if os.access(candidate, os.X_OK):
+            return candidate
+    here = os.path.dirname(os.path.realpath(__file__))
+    return os.path.abspath(os.path.join(here, "..", "..", "stress-ng", "stress-ng"))
+
+
+STRESS_NG = _stress_ng()
 INTENSITY = {"low": (lambda n: 1, 50), "mid": (lambda n: max(1, n // 2), 80), "high": (lambda n: n, 100)}
 
 

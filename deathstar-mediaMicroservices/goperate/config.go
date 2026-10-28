@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 )
 
@@ -41,13 +42,49 @@ func (c serviceConfig) address(key string) (string, error) {
 	return fmt.Sprintf("%s:%d", ep.Addr, ep.Port), nil
 }
 
-// mediaRoot is the deathstar-mediaMicroservices tree: $MEDIA_ROOT, else the checkout on the benchmark host.
+// mediaRoot is the deathstar-mediaMicroservices tree this binary was built in:
+// $MEDIA_ROOT, else $DSB_ROOT/deathstar-mediaMicroservices, else the tree that
+// contains the executable (goperate/bin) or this source file.
 func mediaRoot() string {
 	if v := os.Getenv("MEDIA_ROOT"); v != "" {
 		return v
 	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, "Mercury", "benchmarks", "deathstar-mediaMicroservices")
+	if r := os.Getenv("DSB_ROOT"); r != "" {
+		return filepath.Join(r, "deathstar-mediaMicroservices")
+	}
+	if exe, err := os.Executable(); err == nil {
+		if exe, err = filepath.EvalSymlinks(exe); err == nil {
+			if r := findMedia(filepath.Dir(exe)); r != "" {
+				return r
+			}
+		}
+	}
+	if _, file, _, ok := runtime.Caller(0); ok {
+		if r := findMedia(filepath.Dir(file)); r != "" {
+			return r
+		}
+	}
+	fmt.Fprintln(os.Stderr, "cannot find deathstar-mediaMicroservices; set DSB_ROOT or MEDIA_ROOT")
+	os.Exit(1)
+	return ""
+}
+
+func findMedia(start string) string {
+	dir := start
+	for {
+		launch := filepath.Join(dir, "run", "launch")
+		mod := filepath.Join(dir, "goperate", "go.mod")
+		if info, err := os.Stat(launch); err == nil && !info.IsDir() {
+			if info, err = os.Stat(mod); err == nil && !info.IsDir() {
+				return dir
+			}
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
+	}
 }
 
 // movie is one entry of the seeded dataset. The page service keys movies by id; compose writes reviews by title.
