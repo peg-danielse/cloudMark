@@ -1,0 +1,159 @@
+/*
+ * Copyright (C) 2025-2026 Colin Ian King.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
+ *
+ */
+#include "stress-ng.h"
+#include "core-builtin.h"
+#include "core-cpu-freq.h"
+
+#include <ctype.h>
+#include <float.h>
+
+#if defined(HAVE_SYS_SYSCTL_H) &&	\
+    !defined(__linux__)
+#include <sys/sysctl.h>
+#endif
+
+/*
+ *  stress_zero_cpu_ghz()
+ *	zero CPU clock freq stats
+ */
+static inline void stress_zero_cpu_ghz(stress_cpu_freq_info_t *cpu_freq_info)
+{
+	cpu_freq_info->avg_ghz = 0.0;
+	cpu_freq_info->min_ghz = 0.0;
+	cpu_freq_info->max_ghz = 0.0;
+}
+
+#if defined(__linux__)
+/*
+ *  stress_cpu_freq_get()
+ *	get CPU frequencies in GHz
+ */
+void stress_cpu_freq_get(stress_cpu_freq_info_t *cpu_freq_info)
+{
+	struct dirent **cpu_list = NULL;
+	int i;
+	int n_cpus;
+	int n = 0;
+	double total_freq = 0.0;
+
+	cpu_freq_info->min_ghz = DBL_MAX;
+	cpu_freq_info->max_ghz = 0.0;
+
+	n_cpus = scandir("/sys/devices/system/cpu", &cpu_list, NULL, alphasort);
+	for (i = 0; i < n_cpus; i++) {
+		const char *name = cpu_list[i]->d_name;
+
+		if (!shim_strncmp(name, "cpu", 3) && isdigit((unsigned char)name[3])) {
+			char path[PATH_MAX];
+			double freq;
+			FILE *fp;
+
+			(void)snprintf(path, sizeof(path),
+				"/sys/devices/system/cpu/%s/cpufreq/scaling_cur_freq",
+				name);
+			if ((fp = fopen(path, "r")) != NULL) {
+				if (fscanf(fp, "%lf", &freq) == 1) {
+					if (freq >= 0.0) {
+						total_freq += freq;
+						if (cpu_freq_info->min_ghz > freq)
+							cpu_freq_info->min_ghz = freq;
+						if (cpu_freq_info->max_ghz < freq)
+							cpu_freq_info->max_ghz = freq;
+						n++;
+					}
+				}
+				(void)fclose(fp);
+			}
+		}
+		free(cpu_list[i]);
+	}
+	if (n_cpus > -1)
+		free(cpu_list);
+
+	if (n == 0) {
+		stress_zero_cpu_ghz(cpu_freq_info);
+	} else {
+		cpu_freq_info->avg_ghz = (total_freq / n) * ONE_MILLIONTH;
+		cpu_freq_info->min_ghz *= ONE_MILLIONTH;
+		cpu_freq_info->max_ghz *= ONE_MILLIONTH;
+	}
+}
+#elif defined(__FreeBSD__) ||	\
+      defined(__APPLE__)
+void stress_cpu_freq_get(stress_cpu_freq_info_t *cpu_freq_info)
+{
+	const int32_t ncpus = stress_cpus_configured_get();
+	int32_t i;
+	double total_freq = 0.0;
+	int n = 0;
+
+	cpu_freq_info->min_ghz = DBL_MAX;
+	cpu_freq_info->max_ghz = 0.0;
+
+	for (i = 0; i < ncpus; i++) {
+		double freq;
+#if defined(__FreeBSD__)
+		{
+			char name[32];
+
+			(void)snprintf(name, sizeof(name), "dev.cpu.%" PRIi32 ".freq", i);
+			freq = (double)stress_bsd_getsysctl_uint(name) * ONE_THOUSANDTH;
+		}
+#elif defined(__APPLE__)
+		freq = (double)stress_bsd_getsysctl_uint64("hw.cpufrequency") * ONE_BILLIONTH;
+#endif
+		if (freq >= 0.0) {
+			total_freq += freq;
+			if (cpu_freq_info->min_ghz > freq)
+				cpu_freq_info->min_ghz = freq;
+			if (cpu_freq_info->max_ghz < freq)
+				cpu_freq_info->max_ghz = freq;
+			n++;
+		}
+	}
+	if (n == 0) {
+		stress_zero_cpu_ghz(cpu_freq_info);
+	} else {
+		cpu_freq_info->avg_ghz = (total_freq / n);
+	}
+}
+#elif defined(__OpenBSD__)
+void stress_cpu_freq_get(stress_cpu_freq_info_t *cpu_freq_info)
+{
+	int mib[2];
+	int speed_mhz;
+	size_t size;
+
+	mib[0] = CTL_HW;
+	mib[1] = HW_CPUSPEED;
+	size = sizeof(speed_mhz);
+	if (sysctl(mib, 2, &speed_mhz, &size, NULL, 0) == 0) {
+		cpu_freq_info->avg_ghz = (double)speed_mhz / 1000.0;
+		cpu_freq_info->min_ghz = cpu_freq_info->avg_ghz;
+		cpu_freq_info->max_ghz = cpu_freq_info->avg_ghz;
+	} else {
+		stress_zero_cpu_ghz(cpu_freq_info);
+	}
+}
+#else
+void stress_cpu_freq_get(stress_cpu_freq_info_t *cpu_freq_info)
+{
+	stress_zero_cpu_ghz(cpu_freq_info);
+}
+#endif

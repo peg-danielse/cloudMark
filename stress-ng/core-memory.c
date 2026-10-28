@@ -1,0 +1,592 @@
+/*
+ * Copyright (C) 2014-2021 Canonical, Ltd.
+ * Copyright (C) 2022-2026 Colin Ian King.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
+ *
+ */
+#include "stress-ng.h"
+#include "core-builtin.h"
+#include "core-filesystem.h"
+
+/* Rate to perform expensive low mem checks per instance */
+#define STRESS_LOW_MEM_CHECK_DELAY	(1.0)
+/* Rate to perform expensive cache flushing */
+#define STRESS_FLUSH_CACHE_DELAY	(5.0)
+
+#if defined(HAVE_MACH_MACH_H)
+#include <mach/mach.h>
+#endif
+
+#if defined(HAVE_MACH_VM_STATISTICS_H)
+#include <mach/vm_statistics.h>
+#endif
+
+#if defined(__FreeBSD__) &&	\
+    defined(HAVE_SYS_PARAM_H)
+#include <sys/param.h>
+#endif
+
+#if defined(HAVE_SYS_PRCTL_H)
+#include <sys/prctl.h>
+#endif
+
+#if defined(HAVE_SYS_SWAP_H) &&	\
+    !defined(__sun__)
+#include <sys/swap.h>
+#endif
+
+#if defined(HAVE_UVM_UVM_EXTERN_H)
+#include <uvm/uvm_extern.h>
+#endif
+
+#define PAGE_4K_SHIFT			(12)
+#define PAGE_4K				(1 << PAGE_4K_SHIFT)
+
+/*
+ *  stress_memory_page_size_get()
+ *	get page_size
+ */
+size_t stress_memory_page_size_get(void)
+{
+	static size_t page_size = 0;
+
+	/* Use cached size */
+	if (LIKELY(page_size > 0))
+		return page_size;
+
+#if defined(_SC_PAGESIZE)
+	{
+		/* Use modern sysconf */
+		const long int sz = sysconf(_SC_PAGESIZE);
+
+		if (sz > 0) {
+			page_size = (size_t)sz;
+			return page_size;
+		}
+	}
+#else
+	UNEXPECTED
+#endif
+#if defined(HAVE_GETPAGESIZE)
+	{
+		/* Use deprecated getpagesize */
+		const long int sz = getpagesize();
+
+		if (sz > 0) {
+			page_size = (size_t)sz;
+			return page_size;
+		}
+	}
+#endif
+	/* Guess */
+	page_size = PAGE_4K;
+	return page_size;
+}
+
+/*
+ *  stress_memory_info_get()
+ *	wrapper for linux sysinfo
+ */
+int stress_memory_info_get(stress_memory_info_t *info)
+{
+	if (UNLIKELY(!info))
+		return -1;
+
+	(void)shim_memset(info, 0, sizeof(*info));
+#if defined(HAVE_SYS_SYSINFO_H) &&	\
+    defined(HAVE_SYSINFO) &&		\
+    !defined(__fiwix)
+	{
+		struct sysinfo s_info;
+
+		(void)shim_memset(&s_info, 0, sizeof(s_info));
+		if (LIKELY(sysinfo(&s_info) == 0)) {
+#if defined(__linux__)
+			char buf[64];
+#endif
+
+			info->freemem = s_info.freeram * s_info.mem_unit;
+			info->totalmem = s_info.totalram * s_info.mem_unit;
+			info->freeswap = s_info.freeswap * s_info.mem_unit;
+			info->totalswap = s_info.totalswap * s_info.mem_unit;
+#if defined(__linux__)
+			if (stress_fs_file_read("/proc/sys/kernel/shmall", buf, sizeof(buf)) > 0) {
+				size_t shmall = 0;
+
+				if ((sscanf(buf, "%zu", &shmall) == 1) && (errno == 0))
+					info->shmall = shmall;
+			}
+#else
+			info->shmall = 0;
+#endif
+		}
+		return 0;
+	}
+#endif
+#if defined(__FreeBSD__)
+	{
+		const size_t page_size = (size_t)stress_bsd_getsysctl_uint("vm.stats.vm.v_page_size");
+#if 0
+		/*
+		 *  Enable total swap only when we can determine free swap
+		 */
+		const size_t max_size_t = (size_t)-1;
+		const uint64_t vm_swap_total = stress_bsd_getsysctl_uint64("vm.swap_total");
+
+		info->totalswap = (vm_swap_total >= max_size_t) ? max_size_t : (size_t)vm_swap_total;
+#endif
+		info->freemem = page_size * stress_bsd_getsysctl_uint32("vm.stats.vm.v_free_count");
+		info->totalmem = page_size *
+			(stress_bsd_getsysctl_uint32("vm.stats.vm.v_active_count") +
+			 stress_bsd_getsysctl_uint32("vm.stats.vm.v_inactive_count") +
+			 stress_bsd_getsysctl_uint32("vm.stats.vm.v_laundry_count") +
+			 stress_bsd_getsysctl_uint32("vm.stats.vm.v_wire_count") +
+			 stress_bsd_getsysctl_uint32("vm.stats.vm.v_free_count"));
+		info->freeswap = 0;
+		info->totalswap = 0;
+		info->shmall = 0;
+		return 0;
+	}
+#endif
+#if defined(__NetBSD__) &&	\
+    defined(HAVE_UVM_UVM_EXTERN_H)
+	{
+		struct uvmexp_sysctl u;
+
+		if (stress_bsd_getsysctl("vm.uvmexp2", &u, sizeof(u)) == 0) {
+			info->freemem = (size_t)u.free * u.pagesize;
+			info->totalmem = (size_t)u.npages * u.pagesize;
+			info->totalswap = (size_t)u.swpages * u.pagesize;
+			info->freeswap = info->totalswap - (size_t)u.swpginuse * u.pagesize;
+			info->shmall = 0;
+			return 0;
+		}
+	}
+#endif
+#if defined(__APPLE__) &&		\
+    defined(HAVE_MACH_MACH_H) &&	\
+    defined(HAVE_MACH_VM_STATISTICS_H)
+	{
+		vm_statistics64_data_t vm_stat;
+		mach_port_t host = mach_host_self();
+		natural_t count = HOST_VM_INFO64_COUNT;
+		size_t page_size = stress_memory_page_size_get();
+		int ret;
+
+		/* zero vm_stat, keep cppcheck silent */
+		(void)shim_memset(&vm_stat, 0, sizeof(vm_stat));
+		ret = host_statistics64(host, HOST_VM_INFO64, (host_info64_t)&vm_stat, &count);
+		if (ret >= 0) {
+			info->freemem = page_size * vm_stat.free_count;
+			info->totalmem = page_size * (vm_stat.active_count +
+						 vm_stat.inactive_count +
+						 vm_stat.wire_count +
+						 vm_stat.zero_fill_count);
+			info->totalswap = 0;
+			info->freeswap = 0;
+			info->shmall = 0;
+			return 0;
+		}
+
+	}
+#endif
+	return -1;
+}
+
+/*
+ *  stress_memory_free_get()
+ *	get size of memory that's free in a string, non-reentrant
+ *	note the ' ' space is prefixed before valid strings so the
+ *	output can be used in messages such as:
+ *	   pr_fail("out of memory%s\n", stress_uint64_to_str());
+ */
+char *stress_memory_free_get(void)
+{
+	stress_memory_info_t info;
+	char freemem_str[32];
+	char freeswap_str[32];
+	static char buf[96];
+
+	(void)shim_memset(buf, 0, sizeof(buf));
+	if (stress_memory_info_get(&info) < 0)
+		return buf;
+
+	if ((info.freemem == 0) &&
+	    (info.totalmem == 0) &&
+	    (info.freeswap == 0) &&
+	    (info.totalswap == 0))
+		return buf;
+
+	(void)stress_uint64_to_str(freemem_str, sizeof(freemem_str), (uint64_t)info.freemem, 0, true);
+	(void)stress_uint64_to_str(freeswap_str, sizeof(freeswap_str), (uint64_t)info.freeswap, 0, true);
+	(void)snprintf(buf, sizeof(buf), " (%s mem free, %s swap free)", freemem_str, freeswap_str);
+	return buf;
+}
+
+#if !defined(PR_SET_MEMORY_MERGE)
+#define PR_SET_MEMORY_MERGE	(67)
+#endif
+
+/*
+ *  stress_memory_ksm_merge()
+ *	set kernel samepage merging flag (linux only)
+ */
+void stress_memory_ksm_merge(const int flag)
+{
+#if defined(__linux__) &&		\
+    defined(PR_SET_MEMORY_MERGE) &&	\
+    defined(HAVE_SYS_PRCTL_H)
+	if ((flag >= 0) && (flag <= 1)) {
+		static int prev_flag = -1;
+
+		if (flag != prev_flag) {
+			VOID_RET(int, prctl(PR_SET_MEMORY_MERGE, flag));
+			prev_flag = flag;
+		}
+		(void)stress_fs_file_write("/sys/kernel/mm/ksm/run", "1\n", 2);
+	}
+#else
+	(void)flag;
+#endif
+}
+
+/*
+ *  stress_memory_low_check()
+ *	return true if running low on memory
+ */
+bool stress_memory_low_check(const size_t requested)
+{
+	stress_memory_info_t info;
+	static size_t prev_freemem = 0;
+	static size_t prev_freeswap = 0;
+	static double threshold = -1.0;
+	static double t_whence = 0.0;
+	const double t_now = stress_time_now();
+	bool low_memory = false;
+
+	/*
+	 *  Don't do expensive memory checks if the last call was
+	 *  less than STRESS_LOW_MEM_CHECK_DELAY seconds ago
+	 */
+	if (t_whence > t_now)
+		return false;
+	t_whence = t_now + STRESS_LOW_MEM_CHECK_DELAY;
+
+	if (stress_memory_info_get(&info) == 0) {
+		/*
+		 *  Threshold not set, then get
+		 */
+		if (threshold < 0.0) {
+			size_t bytes = 0;
+
+			if (stress_setting_get("oom-avoid-bytes", &bytes)) {
+				threshold = 100.0 * (double)bytes / (double)info.freemem;
+			} else {
+				/* Not specified, then default to 2.5% */
+				threshold = 2.5;
+			}
+		}
+		/*
+		 *  Stats from previous call valid, then check for memory
+		 *  changes
+		 */
+		if ((prev_freemem + prev_freeswap) > 0) {
+			ssize_t delta;
+
+			delta = (ssize_t)prev_freemem - (ssize_t)info.freemem;
+			delta = (delta * 2) + requested;
+			/* memory shrinking quickly? */
+			if (delta  > (ssize_t)info.freemem) {
+				low_memory = true;
+				goto update;
+			}
+			/* swap shrinking quickly? */
+			delta = (ssize_t)prev_freeswap - (ssize_t)info.freeswap;
+			if (delta > (ssize_t)info.freeswap / 8) {
+				low_memory = true;
+				goto update;
+			}
+		}
+		/* Not enough for allocation and slop? */
+		if (info.freemem < ((4 * STRESS_MB) + requested)) {
+			low_memory = true;
+			goto update;
+		}
+		/* Less than threshold left? */
+		if (((double)(info.freemem - requested) * 100.0 / (double)info.totalmem) < threshold) {
+			low_memory = true;
+			goto update;
+		}
+		/* Any swap enabled with free memory we are too low? */
+		if ((info.totalswap > 0) && (info.freeswap + info.freemem < (requested + (2 * STRESS_MB)))) {
+			low_memory = true;
+			goto update;
+		}
+update:
+		prev_freemem = info.freemem;
+		prev_freeswap = info.freeswap;
+
+		/* low memory? drop caches and automatically enable ksm memory merging */
+		if (low_memory) {
+			if (stress_lock_acquire_relax(g_shared->drop_caches.lock) == 0) {
+				bool drop_caches = false;
+
+				if (g_shared->drop_caches.whence < t_now) {
+					g_shared->drop_caches.whence = t_now + STRESS_FLUSH_CACHE_DELAY;
+					drop_caches = true;
+				}
+				stress_lock_release(g_shared->drop_caches.lock);
+
+				if (drop_caches) {
+					stress_fs_drop_caches(3);
+					stress_memory_ksm_merge(1);
+				}
+			}
+		}
+	}
+	return low_memory;
+}
+
+#if defined(_SC_AVPHYS_PAGES)
+#define STRESS_SC_PAGES	_SC_AVPHYS_PAGES
+#elif defined(_SC_PHYS_PAGES)
+#define STRESS_SC_PAGES	_SC_PHYS_PAGES
+#endif
+
+/*
+ *  stress_memory_phys_size_get()
+ *	get size of physical memory still available, 0 if failed
+ */
+uint64_t stress_memory_phys_size_get(void)
+{
+#if defined(STRESS_SC_PAGES)
+	uint64_t phys_pages;
+	const uint64_t page_size = (uint64_t)stress_memory_page_size_get();
+	const uint64_t max_pages = ~0ULL / page_size;
+	const uint64_t max_size = ~(page_size - 1);
+	long int ret;
+
+	errno = 0;
+	ret = sysconf(STRESS_SC_PAGES);
+	if (UNLIKELY((ret < 0) && (errno != 0)))
+		return 0ULL;
+
+	phys_pages = (uint64_t)ret;
+	/* truncate to max_size rather than overflow */
+	return UNLIKELY(phys_pages > max_pages) ? max_size : phys_pages * page_size;
+#else
+	UNEXPECTED
+	return 0ULL;
+#endif
+}
+
+/*
+ *  stress_memory_usage_get()
+ *	report how much memory is used per instance
+ *	and in total compared to physical memory available
+ */
+void stress_memory_usage_get(
+	stress_args_t *args,
+	const size_t vm_per_instance,
+	const size_t vm_total)
+{
+	const uint64_t total_phys_mem = stress_memory_phys_size_get();
+	char s1[32];
+	char s2[32];
+	char s3[32];
+
+	pr_inf("%s: using %sB per stressor instance (total %sB of %sB available memory)\n",
+		args->name,
+		stress_uint64_to_str(s1, sizeof(s1), (uint64_t)vm_per_instance, 2, true),
+		stress_uint64_to_str(s2, sizeof(s2), (uint64_t)vm_total, 2, true),
+		stress_uint64_to_str(s3, sizeof(s3), total_phys_mem, 2, true));
+}
+
+/*
+ *  stress_memory_address_align
+ *	align address to alignment, alignment MUST be a power of 2
+ */
+void CONST *stress_memory_address_align(const void *addr, const size_t alignment)
+{
+	const uintptr_t uintptr =
+		((uintptr_t)addr + alignment) & ~(alignment - 1);
+
+	return (void *)uintptr;
+}
+
+/*
+ *  stress_memory_anon_name_set()
+ *	set a name to an anonymously mapped vma
+ */
+void stress_memory_anon_name_set(const void *addr, const size_t size, const char *name)
+{
+#if defined(HAVE_SYS_PRCTL_H) &&	\
+    defined(HAVE_PRCTL) &&		\
+    defined(PR_SET_VMA) &&		\
+    defined(PR_SET_VMA_ANON_NAME)
+	VOID_RET(int, prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME,
+			(unsigned long int)addr,
+			(unsigned long int)size,
+			(unsigned long int)name));
+#else
+	(void)addr;
+	(void)size;
+	(void)name;
+#endif
+}
+
+/*
+ *  stress_memory_swap_off()
+ *	swapoff and retry if EINTR occurs
+ */
+int stress_memory_swap_off(const char *path)
+{
+#if defined(HAVE_SYS_SWAP_H) && \
+    defined(HAVE_SWAP)
+	int i;
+
+	if (UNLIKELY(!path)) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	for (i = 0; i < 25; i++) {
+		int ret;
+
+		errno = 0;
+		ret = swapoff(path);
+		if (ret == 0)
+			return ret;
+		if ((ret < 0) && (errno != EINTR))
+			break;
+	}
+	return -1;
+#else
+	if (UNLIKELY(!path)) {
+		errno = EINVAL;
+		return -1;
+	}
+	errno = ENOSYS;
+	return -1;
+#endif
+}
+
+/*
+ *  stress_memory_readable()
+ *	portable way to check if memory addr[0]..addr[len - 1] is readable,
+ *	create pipe, see if write of the memory range works, failure (with
+ *	EFAULT) will be used to indicate address range is not readable.
+ */
+bool stress_memory_readable(const void *addr, const size_t len)
+{
+	int fds[2];
+	bool ret = false;
+
+	if (UNLIKELY(pipe(fds) < 0))
+		return ret;
+	if (write(fds[1], addr, len) == (ssize_t)len)
+		ret = true;
+	(void)close(fds[0]);
+	(void)close(fds[1]);
+
+	return ret;
+}
+
+/*
+ *  stress_memory_usage_by_pid_get()
+ *	get total, resident and shared memory (in bytes)
+ *	used by process with PID pid
+ */
+int stress_memory_usage_by_pid_get(
+	const pid_t pid,
+	size_t *total,
+	size_t *resident,
+	size_t *shared)
+{
+#if defined(__linux__)
+	FILE *fp;
+	char path[PATH_MAX];
+	size_t page_size;
+
+	(void)snprintf(path, sizeof(path), "/proc/%" PRIdMAX "/statm", (intmax_t)pid);
+	fp = fopen(path, "r");
+	if (!fp) {
+		*total = 0;
+		*resident = 0;
+		*shared = 0;
+		return -1;
+	}
+	if (fscanf(fp, "%zu %zu %zu", total, resident, shared) != 3) {
+		(void)fclose(fp);
+		return -1;
+	}
+	(void)fclose(fp);
+
+	page_size = stress_memory_page_size_get();
+	*total *= page_size;
+	*resident *= page_size;
+	*shared *= page_size;
+
+	return 0;
+#else
+	(void)pid;
+
+	*total = 0;
+	*resident = 0;
+	*shared = 0;
+	return -1;
+#endif
+}
+
+/*
+ *  stress_memory_compact()
+ *	attempt to compact kernel memory allocator
+ */
+void stress_memory_compact(void)
+{
+	static bool compact_skip = false;
+	bool compact_memory = false;
+#if defined(__linux__)
+	static const char path[] = "/proc/sys/vm/compact_memory";
+	ssize_t ret;
+
+	if (compact_skip)
+		return;
+
+	(void)stress_setting_get("compact-memory", &compact_memory);
+
+	if (!compact_memory)
+		return;
+	ret = stress_fs_file_write(path, "1", 1);
+	if (ret < 0) {
+		if (!compact_skip) {
+			int err = (int)-ret;
+
+			pr_inf("failed to compact memory, errno=%d (%s), "
+			       "disabling option --compact-memory\n",
+				err, strerror(err));
+			compact_skip = true;
+		}
+	}
+#else
+	stress_setting_get("compact-memory", &compact_memory);
+	if (compact_memory && !compact_skip) {
+		pr_inf("cannot compact memory on this system, "
+		       "disabling option --compact-memory\n");
+		compact_skip = true;
+	}
+#endif
+}

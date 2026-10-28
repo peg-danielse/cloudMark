@@ -1,0 +1,429 @@
+/*
+ * Copyright (C) 2013-2021 Canonical, Ltd.
+ * Copyright (C) 2022-2026 Colin Ian King.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
+ *
+ */
+#include "stress-ng.h"
+#include "core-affinity.h"
+#include "core-builtin.h"
+#include "core-killpid.h"
+#include "core-mmap.h"
+#include "core-out-of-memory.h"
+#include "core-pragma.h"
+#include "core-signal.h"
+
+#include <sys/socket.h>
+
+#define MAX_SOCKET_PAIRS		(32768)
+
+#define MIN_SOCKPAIR_MAX_SIZE		(1)
+#define MAX_SOCKPAIR_MAX_SIZE		(65535)
+#define DEFAULT_SOCKPAIR_MAX_SIZE	(4096)
+
+typedef int sockpair_fds_t[2];
+
+static const stress_help_t help[] = {
+	{ NULL,	"sockpair N",	       "start N workers exercising socket pair I/O activity" },
+	{ NULL, "sockpair-max-size N", "specify maximum size of socket pair data" },
+	{ NULL,	"sockpair-ops N",      "stop after N socket pair bogo operations" },
+	{ NULL,	NULL,                  NULL }
+};
+
+static const stress_opt_t opts[] = {
+	{ OPT_sockpair_max_size, "sockpair-max-size", TYPE_ID_SIZE_T, MIN_SOCKPAIR_MAX_SIZE, MAX_SOCKPAIR_MAX_SIZE, NULL },
+	END_OPT,
+};
+
+/*
+ *  socket_pair_memset()
+ *	set data to be incrementing chars from val upwards
+ */
+static inline void OPTIMIZE3 socket_pair_memset(
+	uint8_t *buf,
+	uint8_t val,
+	const size_t sz)
+{
+	register uint8_t *ptr;
+	register const uint8_t *buf_end = buf + sz;
+	register uint8_t checksum = 0;
+
+PRAGMA_UNROLL_N(4)
+	for (ptr = buf + 1 ; ptr < buf_end; *ptr++ = val++)
+		checksum += val;
+	*buf = checksum;
+}
+
+/*
+ *  socket_pair_memchk()
+ *	check data contains incrementing chars from val upwards
+ */
+static inline int OPTIMIZE3 socket_pair_memchk(
+	const uint8_t *buf,
+	const size_t sz)
+{
+	register const uint8_t *ptr;
+	register const uint8_t *buf_end = buf + sz;
+	register uint8_t checksum = 0;
+
+PRAGMA_UNROLL_N(4)
+	for (ptr = buf + 1; ptr < buf_end; checksum += *ptr++)
+		;
+
+	return !(checksum == *buf);
+}
+
+static void socket_pair_close(
+	sockpair_fds_t *fds,
+	const size_t max,
+	const int which)
+{
+	size_t i;
+
+	for (i = 0; i < max; i++) {
+		(void)close(fds[i][which]);
+		fds[i][which] = -1;
+	}
+}
+
+/*
+ *  socket_pair_try_leak()
+ *	exercise Linux kernel fix:
+ * 	(" 7a62ed61367b8fd") af_unix: Fix memory leaks of the whole sk due to OOB skb.
+ */
+static void socket_pair_try_leak(void)
+{
+#if defined(MSG_OOB)
+	int fds[2];
+
+	if (UNLIKELY(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) < 0))
+		return;
+
+	(void)send(fds[0], "0", 1, MSG_OOB);
+	(void)send(fds[1], "1", 1, MSG_OOB);
+
+	(void)close(fds[0]);
+	(void)close(fds[1]);
+#endif
+}
+
+/*
+ *  stress_sockpair_oomable()
+ *	this stressor needs to be oom-able in the parent
+ *	and child cases
+ */
+static int stress_sockpair_oomable(stress_args_t *args, void *context)
+{
+	uint64_t low_memory_count = 0;
+	pid_t pid;
+	sockpair_fds_t *sockpair_fds;
+	const size_t low_mem_size = args->page_size * 32 * args->instances;
+	size_t sockpair_max_size = DEFAULT_SOCKPAIR_MAX_SIZE;
+	size_t sockpair_fds_sz;
+	size_t max;
+	size_t i;
+	int sockpair_fds_bad[2];
+	int ret;
+	int parent_cpu;
+	double t;
+	double duration;
+	double rate;
+	double bytes = 0.0;
+	const bool oom_avoid = !!(g_opt_flags & OPT_FLAGS_OOM_AVOID);
+
+	(void)context;
+
+	if (!stress_setting_get("sockpair-max-size", &sockpair_max_size)) {
+		if (g_opt_flags & OPT_FLAGS_MAXIMIZE)
+			sockpair_max_size = MAX_SOCKPAIR_MAX_SIZE;
+		if (g_opt_flags & OPT_FLAGS_MINIMIZE)
+			sockpair_max_size = MIN_SOCKPAIR_MAX_SIZE;
+	}
+
+	sockpair_fds_sz = sizeof(*sockpair_fds) * sockpair_max_size;
+	sockpair_fds = stress_mmap_populate(NULL, sockpair_fds_sz,
+				PROT_READ | PROT_WRITE,
+				MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+	if (sockpair_fds == MAP_FAILED) {
+		pr_inf_skip("%s: failed to mmap %zu socket pair file descriptors, "
+			"errno=%d (%s), skipping stressor\n",
+			args->name, sockpair_fds_sz, errno, strerror(errno));
+		return EXIT_NO_RESOURCE;
+	}
+
+	/* exercise invalid socketpair domain */
+	sockpair_fds_bad[0] = -1;
+	sockpair_fds_bad[1] = -1;
+	ret = socketpair(~0, SOCK_STREAM, 0, sockpair_fds_bad);
+	if (UNLIKELY(ret == 0)) {
+		(void)close(sockpair_fds_bad[0]);
+		(void)close(sockpair_fds_bad[1]);
+	}
+
+	/* exercise invalid socketpair type domain */
+	sockpair_fds_bad[0] = -1;
+	sockpair_fds_bad[1] = -1;
+	ret = socketpair(AF_UNIX, ~0, 0, sockpair_fds_bad);
+	if (UNLIKELY(ret == 0)) {
+		(void)close(sockpair_fds_bad[0]);
+		(void)close(sockpair_fds_bad[1]);
+	}
+
+	/* exercise invalid socketpair type protocol */
+	ret = socketpair(AF_UNIX, SOCK_STREAM, ~0, sockpair_fds_bad);
+	if (UNLIKELY(ret == 0)) {
+		(void)close(sockpair_fds_bad[0]);
+		(void)close(sockpair_fds_bad[1]);
+	}
+
+	errno = 0;
+
+	t = stress_time_now();
+	for (max = 0; max < sockpair_max_size; max++) {
+		if (UNLIKELY(!stress_continue(args))) {
+			socket_pair_close(sockpair_fds, max, 0);
+			socket_pair_close(sockpair_fds, max, 1);
+			(void)munmap((void *)sockpair_fds, sockpair_fds_sz);
+			return EXIT_SUCCESS;
+		}
+		if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockpair_fds[max]) < 0)
+			break;
+	}
+	duration = stress_time_now() - t;
+	rate = (duration > 0.0) ? (double)max / duration : 0.0;
+	stress_metrics_set(args, "socketpair calls sec",
+		rate, STRESS_METRIC_HARMONIC_MEAN);
+
+	if (max == 0) {
+		int rc;
+
+		switch (errno) {
+		case EAFNOSUPPORT:
+			if (stress_instance_zero(args))
+				pr_inf_skip("%s: socketpair: address family not supported, "
+					"skipping stressor\n", args->name);
+			rc = EXIT_NO_RESOURCE;
+			break;
+		case EMFILE:
+		case ENFILE:
+			pr_inf("%s: socketpair: out of file descriptors\n",
+				args->name);
+			rc = EXIT_NO_RESOURCE;
+			break;
+		case EPROTONOSUPPORT:
+			if (stress_instance_zero(args))
+				pr_inf_skip("%s: socketpair: protocol not supported, "
+					"skipping stressor\n", args->name);
+			rc = EXIT_NO_RESOURCE;
+			break;
+		case EOPNOTSUPP:
+			if (stress_instance_zero(args))
+				pr_inf_skip("%s: socketpair: protocol does not support "
+					"socket pairs, skipping stressor\n", args->name);
+			rc = EXIT_NO_RESOURCE;
+			break;
+		default:
+			pr_fail("%s: socketpair failed, errno=%d (%s)\n",
+				args->name, errno, strerror(errno));
+			rc = EXIT_FAILURE;
+		}
+		socket_pair_close(sockpair_fds, max, 0);
+		socket_pair_close(sockpair_fds, max, 1);
+		(void)munmap((void *)sockpair_fds, sockpair_fds_sz);
+		return rc;
+	}
+
+	parent_cpu = stress_cpu_get();
+	pid = stress_retry_fork(args, 0);
+	if (pid < 0) {
+		socket_pair_close(sockpair_fds, max, 0);
+		socket_pair_close(sockpair_fds, max, 1);
+
+		if (UNLIKELY(!stress_continue(args)))
+			goto finish;
+		pr_err("%s: fork failed, errno=%d (%s)\n",
+			args->name, errno, strerror(errno));
+		(void)munmap((void *)sockpair_fds, sockpair_fds_sz);
+		return EXIT_FAILURE;
+	} else if (pid == 0) {
+		const bool verify = !!(g_opt_flags & OPT_FLAGS_VERIFY);
+
+		stress_proc_state_set(args->name, STRESS_STATE_RUN);
+		stress_make_it_fail_set();
+		(void)stress_affinity_change_cpu(args, parent_cpu);
+		stress_set_oom_adjustment(args, true);
+		stress_parent_died_alarm();
+		(void)stress_sched_settings_apply(true);
+
+		socket_pair_close(sockpair_fds, max, 1);
+		while (stress_continue(args)) {
+			uint8_t buf[MAX_SOCKPAIR_MAX_SIZE] ALIGN64;
+			ssize_t n;
+
+			for (i = 0; LIKELY(stress_continue(args) && (i < max)); i++) {
+				errno = 0;
+
+				n = read(sockpair_fds[i][0], buf, sockpair_max_size);
+				if (UNLIKELY(n <= 0)) {
+					switch (errno) {
+					case 0:		/* OKAY */
+					case EAGAIN:	/* Redo */
+					case EINTR:	/* Interrupted */
+						continue;
+					case ENFILE:	/* Too many files */
+					case EMFILE:	/* Occurs on socket shutdown */
+					case EPERM:	/* Occurs on socket closure */
+					case EPIPE:	/* Pipe broke */
+						goto abort;
+					default:
+						pr_fail("%s: read failed, errno=%d (%s)\n",
+							args->name, errno, strerror(errno));
+						goto abort;
+					}
+				}
+				if (UNLIKELY(verify && socket_pair_memchk(buf, (size_t)n))) {
+					pr_fail("%s: socket_pair read error detected, "
+						"failed to read expected data\n", args->name);
+				}
+				if (UNLIKELY(oom_avoid && stress_memory_low_check(low_mem_size)))
+					continue;
+				socket_pair_try_leak();
+			}
+		}
+abort:
+		socket_pair_close(sockpair_fds, max, 0);
+		(void)munmap((void *)sockpair_fds, sockpair_fds_sz);
+		_exit(EXIT_SUCCESS);
+	} else {
+		uint8_t buf[MAX_SOCKPAIR_MAX_SIZE] ALIGN64;
+		int val = 0;
+
+		stress_set_oom_adjustment(args, true);
+		stress_parent_died_alarm();
+		(void)stress_sched_settings_apply(true);
+
+		/* Parent */
+		socket_pair_close(sockpair_fds, max, 0);
+
+		duration = 0.0;
+		do {
+			for (i = 0; LIKELY(stress_continue(args) && (i < max)); i++) {
+				ssize_t wret;
+
+				/* Low memory avoidance, re-start */
+				if (UNLIKELY(oom_avoid)) {
+					while (stress_memory_low_check(low_mem_size)) {
+						low_memory_count++;
+						if (UNLIKELY(!stress_continue_flag()))
+							goto tidy;
+						(void)shim_usleep(100000);
+					}
+				}
+
+				socket_pair_memset(buf, (uint8_t)val++, sockpair_max_size);
+				t = stress_time_now();
+				wret = write(sockpair_fds[i][1], buf, sockpair_max_size);
+				if (LIKELY(wret > 0)) {
+					bytes += (double)wret;
+					duration += stress_time_now() - t;
+				} else {
+					if (errno == EPIPE)
+						break;
+					if ((errno == EAGAIN) || (errno == EINTR))
+						continue;
+					if (errno == ECONNRESET) {
+						pr_fail("%s: write failed, errno=%d (%s), "
+							"server process may be killed due to low memory, "
+							"maybe try using --oom-avoid\n",
+							args->name, errno, strerror(errno));
+						break;
+					}
+					if (errno) {
+						pr_fail("%s: write failed, errno=%d (%s)\n",
+							args->name, errno, strerror(errno));
+						break;
+					}
+					continue;
+				}
+				(void)shim_sched_yield();
+				stress_bogo_inc(args);
+			}
+		} while (stress_continue(args));
+
+tidy:
+		rate = (duration > 0.0) ? bytes / duration : 0.0;
+		stress_metrics_set(args, "MB written per sec",
+			rate / (double)STRESS_MB, STRESS_METRIC_HARMONIC_MEAN);
+
+		if (low_memory_count > 0) {
+			pr_dbg("%s: %.2f%% of writes backed off due to low memory\n",
+				args->name, 100.0 * (double)low_memory_count / (double)stress_bogo_get(args));
+		}
+
+		for (i = 0; i < max; i++) {
+			if (shutdown(sockpair_fds[i][1], SHUT_RDWR) < 0)
+				if (errno != ENOTCONN) {
+					pr_fail("%s: shutdown failed, errno=%d (%s)\n",
+						args->name, errno, strerror(errno));
+				}
+		}
+		(void)stress_kill_pid_wait(pid, NULL);
+		socket_pair_close(sockpair_fds, max, 1);
+	}
+finish:
+	(void)munmap((void *)sockpair_fds, sockpair_fds_sz);
+
+	return EXIT_SUCCESS;
+}
+
+/*
+ *  stress_sockpair
+ *	stress by heavy socket_pair I/O
+ */
+static int stress_sockpair(stress_args_t *args)
+{
+	int rc;
+
+	stress_proc_state_set(args->name, STRESS_STATE_SYNC_WAIT);
+	stress_sync_start_wait(args);
+	stress_proc_state_set(args->name, STRESS_STATE_RUN);
+
+	if (stress_signal_handler(args->name, SIGPIPE, stress_signal_ignore_handler, NULL) < 0)
+		return EXIT_NO_RESOURCE;
+
+	rc = stress_oomable_child(args, NULL, stress_sockpair_oomable, STRESS_OOMABLE_DROP_CAP);
+
+	stress_proc_state_set(args->name, STRESS_STATE_DEINIT);
+
+	return rc;
+}
+
+static const stress_exercises_t exercises[] = {
+	STRESS_EX_SYSCALL("close"),
+	STRESS_EX_SYSCALL("read"),
+	STRESS_EX_SYSCALL("socketpair"),
+	STRESS_EX_SYSCALL("write"),
+	STRESS_EX_END,
+};
+
+const stressor_info_t stress_sockpair_info = {
+	.stressor = stress_sockpair,
+	.classifier = CLASS_NETWORK | CLASS_OS,
+	.verify = VERIFY_OPTIONAL,
+	.opts = opts,
+	.help = help,
+	.exercises = exercises,
+};

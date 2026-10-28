@@ -1,0 +1,29 @@
+/*
+ * Copyright (C) 2023-2026 Colin Ian King.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
+ *
+ */
+#ifndef CORE_INTERRUPTS_H
+#define CORE_INTERRUPTS_H
+
+extern void stress_interrupts_start(stress_interrupts_t *counters);
+extern void stress_interrupts_stop(stress_interrupts_t *counters);
+extern void stress_interrupts_check_failure(const char *name,
+	const stress_interrupts_t *counters, const uint32_t instance, int *rc);
+extern void stress_interrupts_dump(FILE *yaml, stress_list_item_t *stressors_list);
+extern void stress_interrupts_tlb(uint64_t *total_tlb, uint64_t *total_ipi);
+
+#endif

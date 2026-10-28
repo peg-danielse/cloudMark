@@ -1,0 +1,832 @@
+/*
+ * Copyright (C) 2013-2021 Canonical, Ltd.
+ * Copyright (C) 2022-2026 Colin Ian King.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
+ *
+ */
+#include "stress-ng.h"
+#include "core-builtin.h"
+#include "core-capabilities.h"
+#include "core-killpid.h"
+#include "core-lock.h"
+#include "core-out-of-memory.h"
+#include "core-pthread.h"
+#include "core-try-open.h"
+
+#include <ctype.h>
+#include <sys/ioctl.h>
+
+static const stress_help_t help[] = {
+	{ NULL,	"bad-ioctl N",		"start N stressors that perform illegal ioctls on devices" },
+	{ NULL, "bad-ioctl-alldev",	"exercise all devices (rather than just /dev/devname0" },
+	{ NULL,	"bad-ioctl-method M",	"method of selecting ioctl command [ random | inc | random-inc | stride ]" },
+	{ NULL,	"bad-ioctl-ops  N",	"stop after N bad ioctl bogo operations" },
+	{ NULL,	NULL,			NULL }
+};
+
+#define IOCTL_TIMEOUT_US		(100000)
+
+/* Index order to stress_bad_ioctl_methods */
+#define STRESS_BAD_IOCTL_CMD_INC	(0)
+#define STRESS_BAD_IOCTL_CMD_RANDOM	(1)
+#define STRESS_BAD_IOCTL_CMD_RANDOM_INC	(2)
+#define STRESS_BAD_IOCTL_CMD_STRIDE	(3)
+
+static const char * const stress_bad_ioctl_methods[] = {
+	"inc",
+	"random",
+	"random-inc",
+	"stride",
+};
+
+static const char *stress_bad_ioctl_method(const size_t i)
+{
+	return (i < SIZEOF_ARRAY(stress_bad_ioctl_methods)) ? stress_bad_ioctl_methods[i] : NULL;
+}
+
+static const stress_opt_t opts[] = {
+	{ OPT_bad_ioctl_alldev, "bad-ioctl-alldev", TYPE_ID_BOOL, 0, 1, NULL },
+	{ OPT_bad_ioctl_method, "bad-ioctl-method", TYPE_ID_SIZE_T_METHOD, 0, 0, stress_bad_ioctl_method },
+	END_OPT,
+};
+
+#if defined(HAVE_LIB_PTHREAD) &&	\
+    defined(HAVE_SIGLONGJMP) &&		\
+    defined(__linux__) &&		\
+    defined(_IOR)
+
+#define MAX_DEV_THREADS		(4)
+
+typedef struct {
+	uint8_t page[4096];
+} stress_4k_page_t;
+
+typedef struct {
+	pthread_t	pthread;
+	stress_pthread_args_t pa;
+	int		ret;
+	size_t		thread_index;
+} stress_bad_ioctl_thread_t;
+
+typedef struct dev_ioctl_info {
+	char	*dev_path;
+	struct dev_ioctl_info *left;
+	struct dev_ioctl_info *right;
+	bool	ignore;
+	volatile uint16_t	ioctl_state;
+	bool	exercised[MAX_DEV_THREADS];
+} dev_ioctl_info_t;
+
+static sigset_t set;
+static void *node_lock;
+static uint32_t mixup;
+static dev_ioctl_info_t *dev_ioctl_info_head;
+static size_t dev_ioctl_info_count;
+static volatile dev_ioctl_info_t *dev_ioctl_node;
+
+typedef struct stress_bad_ioctl_func {
+	const char *devpath;
+	const size_t devpath_len;
+	void (*func)(const char *name, const int fd, const char *devpath);
+} stress_bad_ioctl_func_t;
+
+static sigjmp_buf jmp_env;
+
+static void stress_bad_ioctl_itimer_set(const suseconds_t usec)
+{
+#if defined(HAVE_SETITIMER) &&	\
+    defined(SIGPROF)
+	struct itimerval timer;
+
+	(void)shim_memset(&timer, 0, sizeof(timer));
+	timer.it_value.tv_sec = usec / 1000000;
+	timer.it_value.tv_usec = usec % 1000000;
+	timer.it_interval.tv_sec = timer.it_value.tv_sec;
+	timer.it_interval.tv_usec = timer.it_value.tv_usec;
+
+	(void)setitimer(ITIMER_PROF, &timer, NULL);
+#else
+	(void)usec;
+#endif
+}
+
+/*
+ *  stress_bad_ioctl_dev_new()
+ *	add a new ioctl device path to tree
+ */
+static dev_ioctl_info_t *stress_bad_ioctl_dev_new(
+	dev_ioctl_info_t **head,
+	const char *dev_path)
+{
+	dev_ioctl_info_t *node;
+
+	while (*head) {
+		const int cmp = shim_strcmp((*head)->dev_path, dev_path);
+
+		if (cmp == 0)
+			return *head;
+		head = (cmp > 0) ? &(*head)->left : &(*head)->right;
+	}
+	node = (dev_ioctl_info_t *)calloc(1, sizeof(*node));
+	if (!node)
+		return NULL;
+	node->dev_path = shim_strdup(dev_path);
+	if (!node->dev_path) {
+		free(node);
+		return NULL;
+	}
+	node->ignore = false;
+	node->ioctl_state = stress_mwc16();
+	dev_ioctl_info_count++;
+
+	*head = node;
+	return node;
+}
+
+/*
+ *  stress_bad_ioctl_dev_free()
+ *	free tree
+ */
+static void stress_bad_ioctl_dev_free(dev_ioctl_info_t *node)
+{
+	if (node) {
+		stress_bad_ioctl_dev_free(node->left);
+		stress_bad_ioctl_dev_free(node->right);
+		free(node->dev_path);
+		free(node);
+	}
+}
+
+/*
+ *  stress_bad_ioctl_dev_dir()
+ *	read dev directory, add device information to tree
+ */
+static void stress_bad_ioctl_dev_dir(
+	stress_args_t *args,
+	const char *path,
+	const int depth,
+	const bool bad_ioctl_alldev)
+{
+	struct dirent **dlist;
+	const mode_t flags = S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
+	int i;
+	int n;
+
+	if (UNLIKELY(!stress_continue_flag()))
+		return;
+
+	/* Don't want to go too deep */
+	if (depth > 20)
+		return;
+
+	dlist = NULL;
+	n = scandir(path, &dlist, NULL, alphasort);
+	if (n <= 0)
+		goto done;
+
+	for (i = 0; i < n; i++) {
+		int ret;
+		struct stat buf;
+		char tmp[PATH_MAX];
+		const struct dirent *d = dlist[i];
+		size_t len;
+
+		if (UNLIKELY(!stress_continue(args)))
+			break;
+		if (stress_fs_filename_dotty(d->d_name))
+			continue;
+
+		len = shim_strlen(d->d_name);
+
+		/*
+		 *  Exercise no more than 1 of the same device
+		 *  driver, e.g. ttyS0..ttyS1
+		 */
+		if (!bad_ioctl_alldev && (len > 1)) {
+			int dev_n;
+			const char *ptr = d->d_name + len - 1;
+
+			while ((ptr > d->d_name) && isdigit((unsigned char)*ptr))
+				ptr--;
+			ptr++;
+			if (sscanf(ptr, "%d", &dev_n) != 1)
+				continue;
+			if (dev_n > 1)
+				continue;
+		}
+
+		switch (shim_dirent_type(path, d)) {
+		case SHIM_DT_DIR:
+			(void)stress_fs_make_filename(tmp, sizeof(tmp), path, d->d_name);
+			ret = shim_stat(tmp, &buf);
+			if (ret < 0)
+				continue;
+			if ((buf.st_mode & flags) == 0)
+				continue;
+			stress_bad_ioctl_dev_dir(args, tmp, depth + 1, bad_ioctl_alldev);
+			break;
+		case SHIM_DT_BLK:
+		case SHIM_DT_CHR:
+			(void)stress_fs_make_filename(tmp, sizeof(tmp), path, d->d_name);
+			if (shim_strstr(tmp, "watchdog"))
+				continue;
+			stress_bad_ioctl_dev_new(&dev_ioctl_info_head, tmp);
+			break;
+		default:
+			break;
+		}
+	}
+done:
+	stress_fs_dirent_list_free(dlist, n);
+}
+
+static void MLOCKED_TEXT stress_sig_handler(int signum)
+{
+	stress_bad_ioctl_itimer_set(0);
+	if (signum == SIGALRM)
+		stress_signal_siglongjmp(signum, jmp_env, 1);
+}
+
+static int stress_bad_ioctl_rd_data(
+	stress_args_t *args,
+	uint64_t *buf,
+	const int fd,
+	const uint8_t type,
+	const uint8_t nr,
+	const size_t page_size)
+{
+	const double threshold = IOCTL_TIMEOUT_US / 1000000.0;
+	double t_start;
+
+	/*
+	 *  read/write page, last value in page
+	 */
+	t_start = stress_time_now();
+	stress_bad_ioctl_itimer_set(IOCTL_TIMEOUT_US);
+	VOID_RET(int, ioctl(fd, _IOR(type, nr, uint64_t), (uint64_t *)((uintptr_t)buf + page_size - 8)));
+	if (stress_time_now() - t_start > threshold)
+		return -1;
+
+	t_start = stress_time_now();
+	stress_bad_ioctl_itimer_set(IOCTL_TIMEOUT_US);
+	VOID_RET(int, ioctl(fd, _IOR(type, nr, uint32_t), (uint32_t *)((uintptr_t)buf + page_size - 4)));
+	if (stress_time_now() - t_start > threshold)
+		return -1;
+
+	t_start = stress_time_now();
+	stress_bad_ioctl_itimer_set(IOCTL_TIMEOUT_US);
+	VOID_RET(int, ioctl(fd, _IOR(type, nr, uint16_t), (uint16_t *)((uintptr_t)buf + page_size - 2)));
+	if (stress_time_now() - t_start > threshold)
+		return -1;
+
+	t_start = stress_time_now();
+	stress_bad_ioctl_itimer_set(IOCTL_TIMEOUT_US);
+	VOID_RET(int, ioctl(fd, _IOR(type, nr, uint8_t), (uint8_t *)((uintptr_t)buf + page_size - 1)));
+	if (stress_time_now() - t_start > threshold)
+		return -1;
+
+	t_start = stress_time_now();
+	stress_bad_ioctl_itimer_set(IOCTL_TIMEOUT_US);
+	VOID_RET(int, ioctl(fd, _IOR(type, nr, stress_4k_page_t), buf));
+	if (stress_time_now() - t_start > threshold)
+		return -1;
+
+	/*
+	 *  misaligned addresses
+	 */
+	t_start = stress_time_now();
+	stress_bad_ioctl_itimer_set(IOCTL_TIMEOUT_US);
+	VOID_RET(int, ioctl(fd, _IOR(type, nr, uint64_t), buf + 1));
+	if (stress_time_now() - t_start > threshold)
+		return -1;
+
+	t_start = stress_time_now();
+	stress_bad_ioctl_itimer_set(IOCTL_TIMEOUT_US);
+	VOID_RET(int, ioctl(fd, _IOR(type, nr, uint32_t), buf + 1));
+	if (stress_time_now() - t_start > threshold)
+		return -1;
+
+	t_start = stress_time_now();
+	stress_bad_ioctl_itimer_set(IOCTL_TIMEOUT_US);
+	VOID_RET(int, ioctl(fd, _IOR(type, nr, uint16_t), buf + 1));
+	if (stress_time_now() - t_start > threshold)
+		return -1;
+
+	/*
+	 *  NULL address
+	 */
+	t_start = stress_time_now();
+	stress_bad_ioctl_itimer_set(IOCTL_TIMEOUT_US);
+	VOID_RET(int, ioctl(fd, _IOR(type, nr, uint64_t), NULL));
+	if (stress_time_now() - t_start > threshold)
+		return -1;
+
+	t_start = stress_time_now();
+	stress_bad_ioctl_itimer_set(IOCTL_TIMEOUT_US);
+	VOID_RET(int, ioctl(fd, _IOR(type, nr, uint32_t), NULL));
+	if (stress_time_now() - t_start > threshold)
+		return -1;
+
+	t_start = stress_time_now();
+	stress_bad_ioctl_itimer_set(IOCTL_TIMEOUT_US);
+	VOID_RET(int, ioctl(fd, _IOR(type, nr, uint16_t), NULL));
+	if (stress_time_now() - t_start > threshold)
+		return -1;
+
+	t_start = stress_time_now();
+	stress_bad_ioctl_itimer_set(IOCTL_TIMEOUT_US);
+	VOID_RET(int, ioctl(fd, _IOR(type, nr, uint8_t), NULL));
+	if (stress_time_now() - t_start > threshold)
+		return -1;
+
+	/*
+	 *  PROT_NONE pages
+	 */
+	t_start = stress_time_now();
+	stress_bad_ioctl_itimer_set(IOCTL_TIMEOUT_US);
+	VOID_RET(int, ioctl(fd, _IOR(type, nr, uint64_t), args->mapped->page_none));
+	if (stress_time_now() - t_start > threshold)
+		return -1;
+
+	t_start = stress_time_now();
+	stress_bad_ioctl_itimer_set(IOCTL_TIMEOUT_US);
+	VOID_RET(int, ioctl(fd, _IOR(type, nr, uint32_t), args->mapped->page_none));
+	if (stress_time_now() - t_start > threshold)
+		return -1;
+
+	t_start = stress_time_now();
+	stress_bad_ioctl_itimer_set(IOCTL_TIMEOUT_US);
+	VOID_RET(int, ioctl(fd, _IOR(type, nr, uint16_t), args->mapped->page_none));
+	if (stress_time_now() - t_start > threshold)
+		return -1;
+
+	t_start = stress_time_now();
+	stress_bad_ioctl_itimer_set(IOCTL_TIMEOUT_US);
+	VOID_RET(int, ioctl(fd, _IOR(type, nr, uint8_t), args->mapped->page_none));
+	if (stress_time_now() - t_start > threshold)
+		return -1;
+
+	/*
+	 *  read-only pages
+	 */
+	t_start = stress_time_now();
+	stress_bad_ioctl_itimer_set(IOCTL_TIMEOUT_US);
+	VOID_RET(int, ioctl(fd, _IOR(type, nr, uint64_t), args->mapped->page_ro));
+	if (stress_time_now() - t_start > threshold)
+		return -1;
+
+	t_start = stress_time_now();
+	stress_bad_ioctl_itimer_set(IOCTL_TIMEOUT_US);
+	VOID_RET(int, ioctl(fd, _IOR(type, nr, uint32_t), args->mapped->page_ro));
+	if (stress_time_now() - t_start > threshold)
+		return -1;
+
+	t_start = stress_time_now();
+	stress_bad_ioctl_itimer_set(IOCTL_TIMEOUT_US);
+	VOID_RET(int, ioctl(fd, _IOR(type, nr, uint16_t), args->mapped->page_ro));
+	if (stress_time_now() - t_start > threshold)
+		return -1;
+
+	t_start = stress_time_now();
+	stress_bad_ioctl_itimer_set(IOCTL_TIMEOUT_US);
+	VOID_RET(int, ioctl(fd, _IOR(type, nr, uint8_t), args->mapped->page_ro));
+	if (stress_time_now() - t_start > threshold)
+		return -1;
+
+	/*
+	 *  page boundary with PROT_NONE on 2nd page
+	 */
+	t_start = stress_time_now();
+	stress_bad_ioctl_itimer_set(IOCTL_TIMEOUT_US);
+	VOID_RET(int, ioctl(fd, _IOR(type, nr, uint64_t), (uint64_t *)((uintptr_t)buf + page_size - 4)));
+	if (stress_time_now() - t_start > threshold)
+		return -1;
+
+	t_start = stress_time_now();
+	stress_bad_ioctl_itimer_set(IOCTL_TIMEOUT_US);
+	VOID_RET(int, ioctl(fd, _IOR(type, nr, uint32_t), (uint32_t *)((uintptr_t)buf + page_size - 2)));
+	if (stress_time_now() - t_start > threshold)
+		return -1;
+
+	t_start = stress_time_now();
+	stress_bad_ioctl_itimer_set(IOCTL_TIMEOUT_US);
+	VOID_RET(int, ioctl(fd, _IOR(type, nr, uint16_t), (uint16_t *)((uintptr_t)buf + page_size - 1)));
+	if (stress_time_now() - t_start > threshold)
+		return -1;
+
+	return 0;
+}
+
+#if defined(_IOW)
+static int stress_bad_ioctl_wr_data(
+	stress_args_t *args,
+	const int fd,
+	const uint8_t type,
+	const uint8_t nr)
+{
+	const double threshold = IOCTL_TIMEOUT_US / 1000000.0;
+	double t_start;
+
+	/*
+	 *  ioctl to PROT_NONE page
+	 */
+	t_start = stress_time_now();
+	stress_bad_ioctl_itimer_set(IOCTL_TIMEOUT_US);
+	VOID_RET(int, ioctl(fd, _IOW(type, nr, uint64_t), args->mapped->page_none));
+	if (stress_time_now() - t_start > threshold)
+		return -1;
+
+	t_start = stress_time_now();
+	stress_bad_ioctl_itimer_set(IOCTL_TIMEOUT_US);
+	VOID_RET(int, ioctl(fd, _IOW(type, nr, uint32_t), args->mapped->page_none));
+	if (stress_time_now() - t_start > threshold)
+		return -1;
+
+	t_start = stress_time_now();
+	stress_bad_ioctl_itimer_set(IOCTL_TIMEOUT_US);
+	VOID_RET(int, ioctl(fd, _IOW(type, nr, uint16_t), args->mapped->page_none));
+	if (stress_time_now() - t_start > threshold)
+		return -1;
+
+	t_start = stress_time_now();
+	stress_bad_ioctl_itimer_set(IOCTL_TIMEOUT_US);
+	VOID_RET(int, ioctl(fd, _IOW(type, nr, uint8_t), args->mapped->page_none));
+	if (stress_time_now() - t_start > threshold)
+		return -1;
+	return 0;
+}
+#endif
+
+/*
+ *  stress_bad_ioctl_rw()
+ *	exercise a dev entry
+ */
+static inline void stress_bad_ioctl_rw(
+	stress_args_t *args,
+	const bool is_pthread,
+	const size_t thread_index)
+{
+	const size_t page_size = args->page_size;
+	uint64_t *buf;
+	uint64_t *buf_page1;
+
+	/*
+	 *  Map in 2 pages, the last page will be unmapped to
+	 *  create a single mapped page with an unmapped page
+	 *  following it.  Note that buf points to 64 bit values
+	 *  so the compiler can deduce that buf8..buf32 casts
+	 *  will align correctly for the smaller types.
+	 */
+	buf = (uint64_t *)mmap(NULL, page_size << 1, PROT_READ | PROT_WRITE,
+		MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (buf == MAP_FAILED)
+		return;
+	stress_memory_anon_name_set(buf, page_size << 1, "ioctl-rw");
+
+	/*
+	 *  Unmap last page so we know that the page following
+	 *  buf is definitely not read/writeable
+	 */
+	buf_page1 = (uint64_t *)((uintptr_t)buf + page_size);
+	(void)munmap((void *)buf_page1, page_size);
+
+	do {
+		int fd;
+		int ret;
+		uint8_t type;
+		uint8_t nr;
+		volatile dev_ioctl_info_t *node;
+
+		stress_bad_ioctl_itimer_set(0);
+
+		ret = stress_lock_acquire(node_lock);
+		if (ret)
+			break;
+		node = dev_ioctl_node;
+		(void)stress_lock_release(node_lock);
+
+		if (!node || !stress_continue_flag())
+			break;
+		type = (node->ioctl_state >> 8) & 0xff;
+		nr = (node->ioctl_state) & 0xff;
+
+		if ((fd = open(node->dev_path, O_RDONLY | O_NONBLOCK)) < 0)
+			break;
+
+		ret = sigsetjmp(jmp_env, 1);
+		if (ret != 0) {
+			(void)close(fd);
+			continue;
+		}
+
+		stress_uint8rnd4((uint8_t *)buf, page_size);
+		if (stress_bad_ioctl_rd_data(args, buf, fd, type, nr, page_size) < 0) {
+			(void)close(fd);
+			break;
+		}
+#if defined(_IOW)
+		if (stress_bad_ioctl_wr_data(args, fd, type, nr) < 0) {
+			(void)close(fd);
+			break;
+		}
+#endif
+
+		(void)close(fd);
+		stress_bad_ioctl_itimer_set(0);
+
+		if (thread_index < MAX_DEV_THREADS) {
+			ret = stress_lock_acquire(node_lock);
+			if (ret)
+				break;
+			node->exercised[thread_index] = true;
+			(void)stress_lock_release(node_lock);
+		}
+	} while (is_pthread);
+
+	stress_bad_ioctl_itimer_set(0);
+	(void)munmap((void *)buf, page_size);
+}
+
+/*
+ *  stress_bad_ioctl_thread
+ *	keep exercising a /dev entry until
+ *	controlling thread triggers an exit
+ */
+static void *stress_bad_ioctl_thread(void *arg)
+{
+	const stress_pthread_args_t *pa = (stress_pthread_args_t *)arg;
+	stress_args_t *args = pa->args;
+	const stress_bad_ioctl_thread_t *thread = (const stress_bad_ioctl_thread_t *)pa->data;
+
+	/*
+	 *  Block all signals, let controlling thread
+	 *  handle these
+	 */
+	(void)sigprocmask(SIG_BLOCK, &set, NULL);
+
+	stress_random_small_sleep();
+
+	while (stress_continue_flag())
+		stress_bad_ioctl_rw(args, true, thread->thread_index);
+
+	return &g_nowt;
+}
+
+/*
+ *  stress_bad_ioctl_dir()
+ *	read directory
+ */
+static void stress_bad_ioctl_dir(
+	stress_args_t *args,
+	dev_ioctl_info_t *node,
+	uint32_t offset,
+	const int bad_ioctl_method)
+{
+	int ret;
+
+	if (UNLIKELY(!stress_continue_flag()))
+		return;
+	if (!node)
+		return;
+
+	stress_bad_ioctl_dir(args, node->left, offset, bad_ioctl_method);
+	ret = stress_try_open(args, node->dev_path, O_RDONLY | O_NONBLOCK, 15000000);
+	if (ret == STRESS_TRY_OPEN_FAIL) {
+		node->ignore = true;
+	} else if (!node->ignore) {
+		if (offset > 1) {
+			offset--;
+		} else {
+			ret = stress_lock_acquire(node_lock);
+			if (!ret) {
+				size_t i;
+				bool all_exercised = true;
+
+				for (i = 0; i < SIZEOF_ARRAY(node->exercised); i++) {
+					if (!node->exercised[i]) {
+						all_exercised = false;
+						break;
+					}
+				}
+				if (all_exercised) {
+					uint8_t type;
+					uint8_t nr;
+					static const uint16_t masks[] = {
+						0x000f,
+						0x00ff,
+						0x0fff,
+						0xffff,
+						0xfff0,
+						0xff00,
+						0xf000,
+						0x0f0f,
+						0xf00f,
+						0xf0f0,
+						0x0ff0,
+					};
+
+					switch (bad_ioctl_method) {
+					case STRESS_BAD_IOCTL_CMD_RANDOM:
+						node->ioctl_state = stress_mwc16() &
+							masks[stress_mwcsizemodn(SIZEOF_ARRAY(masks))];
+						break;
+					case STRESS_BAD_IOCTL_CMD_INC:
+						node->ioctl_state++;
+						break;
+					default:
+					case STRESS_BAD_IOCTL_CMD_RANDOM_INC:
+						node->ioctl_state += stress_mwc8();
+						break;
+					case STRESS_BAD_IOCTL_CMD_STRIDE:
+						type = ((node->ioctl_state >> 8) & 0xff) - 3;
+						nr = ((node->ioctl_state) & 0xff) + 1;
+						node->ioctl_state = (uint16_t)(((uint16_t)type) << 8) | nr;
+						break;
+					}
+				}
+				dev_ioctl_node = node;
+				(void)shim_memset(node->exercised, 0, sizeof(node->exercised));
+				(void)stress_lock_release(node_lock);
+				stress_bad_ioctl_rw(args, false, (size_t)-1);
+			}
+		}
+		stress_bogo_inc(args);
+	}
+	stress_bad_ioctl_dir(args, node->right, offset, bad_ioctl_method);
+}
+
+/*
+ *  stress_bad_ioctl
+ *	stress read-only ioctls on all of /dev
+ */
+static int stress_bad_ioctl(stress_args_t *args)
+{
+	stress_bad_ioctl_thread_t threads[MAX_DEV_THREADS];
+	int rc = EXIT_SUCCESS;
+	int bad_ioctl_method = STRESS_BAD_IOCTL_CMD_RANDOM_INC;
+	bool bad_ioctl_alldev = false;
+
+	node_lock = NULL;
+	dev_ioctl_info_head = NULL;
+	dev_ioctl_info_count = 0;
+	dev_ioctl_node = NULL;
+
+	(void)stress_setting_get("bad-ioctl-alldev", &bad_ioctl_alldev);
+	(void)stress_setting_get("bad-ioctl-method", &bad_ioctl_method);
+
+	stress_bad_ioctl_dev_dir(args, "/dev", 0, bad_ioctl_alldev);
+	dev_ioctl_node = dev_ioctl_info_head;
+
+	if (stress_instance_zero(args))
+		pr_inf("%s: %zu unique devices being exercised with ioctl calls\n", args->name, dev_ioctl_info_count);
+
+	stress_proc_state_set(args->name, STRESS_STATE_SYNC_WAIT);
+	stress_sync_start_wait(args);
+	stress_proc_state_set(args->name, STRESS_STATE_RUN);
+
+	do {
+		pid_t pid;
+
+		pid = stress_retry_fork(args, 0);
+		if (pid < 0) {
+			if (UNLIKELY(!stress_continue(args)))
+				return EXIT_SUCCESS;
+			pr_fail("%s: fork failed, errno=%d (%s)\n",
+				args->name, errno, strerror(errno));
+			rc = EXIT_FAILURE;
+			break;
+		} else if (pid > 0) {
+			int status;
+			pid_t wret;
+
+			/* Parent, wait for child */
+			wret = shim_waitpid(pid, &status, 0);
+			if (wret < 0) {
+				if (errno != EINTR)
+					pr_dbg("%s: waitpid() on PID %" PRIdMAX " failed, errno=%d (%s)\n",
+						args->name, (intmax_t)pid, errno, strerror(errno));
+				stress_force_killed_bogo(args);
+				(void)stress_kill_pid_wait(pid, NULL);
+			} else {
+				if (WIFEXITED(status) &&
+				    (WEXITSTATUS(status) != 0)) {
+					rc = EXIT_FAILURE;
+					break;
+				}
+			}
+		} else if (pid == 0) {
+			size_t i;
+			int r;
+			int ssjret;
+			uint32_t offset;
+
+			stress_proc_state_set(args->name, STRESS_STATE_RUN);
+
+			stress_bad_ioctl_itimer_set(0);
+
+			ssjret = sigsetjmp(jmp_env, 1);
+			if (ssjret != 0) {
+				pr_fail("%s: caught an unexpected segmentation fault\n", args->name);
+				_exit(EXIT_FAILURE);
+			}
+
+			if (stress_signal_handler(args->name, SIGSEGV, stress_sig_handler, NULL) < 0)
+				_exit(EXIT_NO_RESOURCE);
+#if defined(HAVE_SETITIMER) &&	\
+    defined(SIGPROF)
+			if (stress_signal_handler(args->name, SIGPROF, stress_sig_handler, NULL) < 0)
+				_exit(EXIT_NO_RESOURCE);
+#endif
+
+			stress_make_it_fail_set();
+			stress_parent_died_alarm();
+			(void)stress_sched_settings_apply(true);
+			node_lock = stress_lock_create("dev-path");
+			if (!node_lock) {
+				pr_inf("%s: lock create failed\n", args->name);
+				_exit(EXIT_NO_RESOURCE);
+			}
+
+			/* Make sure this is killable by OOM killer */
+			stress_set_oom_adjustment(args, true);
+			mixup = stress_mwc32();
+
+			for (i = 0; i < MAX_DEV_THREADS; i++) {
+				threads[i].thread_index = i;
+				threads[i].pa.args = args;
+				threads[i].pa.data = &threads[i];
+				threads[i].ret = pthread_create(&threads[i].pthread, NULL,
+							stress_bad_ioctl_thread,
+							(void *)&threads[i].pa);
+			}
+
+			offset = args->instance;
+			do {
+				stress_bad_ioctl_dir(args, dev_ioctl_info_head, offset, bad_ioctl_method);
+				offset = 0;
+			} while (stress_continue(args));
+
+			r = stress_lock_acquire(node_lock);
+			if (r) {
+				pr_dbg("%s: failed to acquire lock for dev_path\n", args->name);
+			} else {
+				dev_ioctl_node = NULL;
+				(void)stress_lock_release(node_lock);
+			}
+
+			for (i = 0; i < MAX_DEV_THREADS; i++) {
+				if (threads[i].ret == 0)
+					(void)pthread_join(threads[i].pthread, NULL);
+			}
+			(void)stress_lock_destroy(node_lock);
+
+			_exit(EXIT_SUCCESS);
+		}
+	} while (stress_continue(args));
+
+	stress_proc_state_set(args->name, STRESS_STATE_DEINIT);
+
+	stress_bad_ioctl_dev_free(dev_ioctl_info_head);
+
+	return rc;
+}
+
+static const stress_exercises_t exercises[] = {
+	STRESS_EX_SYSCALL("ioctl"),
+
+#if defined(HAVE_LIB_PTHREAD)
+	STRESS_EX_LIBRARY("pthread"),
+#endif
+
+	STRESS_EX_END,
+};
+
+const stressor_info_t stress_bad_ioctl_info = {
+	.stressor = stress_bad_ioctl,
+	.classifier = CLASS_DEV | CLASS_OS | CLASS_PATHOLOGICAL,
+	.opts = opts,
+	.help = help,
+	.exercises = exercises,
+};
+#else
+const stressor_info_t stress_bad_ioctl_info = {
+	.stressor = stress_unimplemented,
+	.classifier = CLASS_DEV | CLASS_OS | CLASS_PATHOLOGICAL,
+	.opts = opts,
+	.help = help,
+	.unimplemented_reason = "built without siglongjmp, pthread or ioctl() _IOR macro or is not Linux"
+};
+#endif

@@ -1,0 +1,150 @@
+/*
+ * Copyright (C) 2023-2026 Colin Ian King.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
+ *
+ */
+#include "stress-ng.h"
+#include "core-builtin.h"
+#include "core-processes.h"
+
+#include <ctype.h>
+#include <pwd.h>
+
+#if defined(__linux__)
+/*
+ *  stress_dump_processes_filter()
+ *	filter out non-process filenames from /proc
+ */
+static int stress_processes_dump_filter(const struct dirent *d)
+{
+	if (UNLIKELY(!d))
+		return 0;
+
+	return isdigit((int)d->d_name[0]);
+}
+
+/*
+ *  stress_processes_dump()
+ *	dump out names and state of running processes
+ */
+void stress_processes_dump(void)
+{
+	int i;
+	int n;
+	int pid_width = 5;
+
+	struct dirent **namelist = NULL;
+
+	n = scandir("/proc", &namelist, stress_processes_dump_filter, alphasort);
+	if (UNLIKELY(n <= 0))
+		return;
+
+	for (i = 0; i < n; i++) {
+		const int len = (int)shim_strlen(namelist[i]->d_name);
+
+		pid_width = STRESS_MAXIMUM(pid_width, len);
+	}
+
+	for (i = 0; i < n; i++) {
+		char path[PATH_MAX];
+		struct stat statbuf;
+		char buf[8192];
+		char cmd[4096];
+		char state[16];
+		char name[32];
+		const char *p_name;
+		pid_t pid;
+		pid_t ppid;
+		ssize_t ret;
+		long val;
+
+		(void)shim_memset(cmd, 0, sizeof(cmd));
+		(void)snprintf(path, sizeof(path), "/proc/%s/cmdline", namelist[i]->d_name);
+		ret = stress_fs_file_read(path, cmd, sizeof(cmd));
+		if (ret > 0) {
+			int j;
+
+			for (j = 0; j < (int)ret; j++) {
+				if (cmd[j] == '\0')
+					cmd[j] = ' ';
+			}
+			for (j--; j > 0; j--) {
+				if (cmd[j] == ' ')
+					cmd[j] = '\0';
+				else
+					break;
+			}
+		}
+		if (shim_strstr(cmd, "stress-ng") == NULL)
+			continue;
+
+		if (sscanf(namelist[i]->d_name, "%ld", &val) != 1)
+			continue;
+
+		pid = (pid_t)val;
+		ppid = 0;
+		p_name = "?";
+		(void)shim_strscpy(state, "?", sizeof(state));
+		(void)snprintf(path, sizeof(path), "/proc/%s", namelist[i]->d_name);
+		if (shim_stat(path, &statbuf) == 0) {
+#if defined(BUILD_STATIC)
+			(void)snprintf(name, sizeof(name), "%u", (unsigned int)statbuf.st_uid);
+			p_name = name;
+#else
+			struct passwd pwd;
+			struct passwd *pwd_ptr = NULL;
+			char pwdbuf[1024];
+
+			(void)shim_getpwuid_r(statbuf.st_uid, &pwd, pwdbuf, sizeof(pwdbuf), &pwd_ptr);
+			if (pwd_ptr && pwd_ptr->pw_name) {
+				p_name = pwd_ptr->pw_name;
+			} else {
+				(void)snprintf(name, sizeof(name), "%u", (unsigned int)statbuf.st_uid);
+				p_name = name;
+			}
+#endif
+		}
+
+		(void)snprintf(path, sizeof(path), "/proc/%s/status", namelist[i]->d_name);
+		ret = stress_fs_file_read(path, buf, sizeof(buf));
+		if (ret > 0) {
+			const char *ptr;
+
+			ptr = shim_strstr(buf, "\nPPid:");
+			if (ptr) {
+				intmax_t ppid_val;
+
+				if (sscanf(ptr, "\nPPid:%" SCNdMAX, &ppid_val) != 1)
+					val = 0;
+				ppid = (pid_t)ppid_val;
+			}
+			(void)shim_strscpy(state, "?", sizeof(state));
+			ptr = shim_strstr(buf, "\nState:");
+			if (ptr) {
+				if (sscanf(ptr, "\nState:%1s", state) != 1)
+					(void)shim_strscpy(state, "?", sizeof(state));
+			}
+		}
+		pr_inf("proc: %-8.8s %*" PRIdMAX " %*" PRIdMAX " %c %s\n", p_name,
+				pid_width, (intmax_t)pid, pid_width, (intmax_t)ppid, state[0], cmd);
+	}
+	stress_fs_dirent_list_free(namelist, n);
+}
+#else
+void stress_processes_dump(void)
+{
+}
+#endif

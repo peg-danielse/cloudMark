@@ -1,0 +1,713 @@
+/*
+ * Copyright (C) 2026      Colin Ian King.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
+ *
+ */
+#include "stress-ng.h"
+#include "core-attribute.h"
+#include "core-builtin.h"
+#include "core-capabilities.h"
+#include "core-madvise.h"
+#include "core-mmap.h"
+#include "core-numa.h"
+#include "core-target-clones.h"
+
+#include <ctype.h>
+#include <sched.h>
+
+#if defined(HAVE_LINUX_MEMPOLICY_H)
+#include <linux/mempolicy.h>
+#endif
+
+#define NUMACOPY_AFFINIY_INTERVAL	(0.05)	/* every 0.05 seconds, 20Hz */
+
+#define STRESS_NUMACOPY_LOOPS		(100)
+#define NUMA_NODES_MAX 			(64L)
+
+#define NUMACOPY_AFFINITY_NEXT		(0x00)
+#define NUMACOPY_AFFINITY_NONE		(0x01)
+#define NUMACOPY_AFFINITY_NODE		(0x02)
+#define NUMACOPY_AFFINITY_PREV		(0x03)
+#define NUMACOPY_AFFINITY_RANDOM	(0x04)
+
+static const stress_help_t help[] = {
+	{ NULL,	"numacopy N",          "start N workers copying pagess between NUMA nodes" },
+	{ NULL, "numacopy-affinity A", "select cpu affinity [ next | none | node | prev | random ]" },
+	{ NULL, "numacopy-mode M",     "select mbind mode flags [ bind | interleave | preferred | weighted-interleave ]" },
+	{ NULL,	"numacopy-ops N",      "stop after N NUMA page copying bogo operations" },
+	{ NULL,	NULL,                  NULL }
+};
+
+typedef struct stress_numacopy_metric {
+	double duration;
+	double rate;
+} stress_numacopy_metric_t;
+
+/* CPUs associated with Nth NUMA node */
+typedef struct stress_numacopy_cpus {
+	size_t count;
+	uint32_t *cpus;
+	size_t  index;
+} stress_numacopy_cpus_t;
+
+/* NUMA mbind mode options */
+typedef struct stress_numacopy_mode {
+	const char *name;
+	const int mode;
+} stress_numacopy_mode_t;
+
+typedef struct stress_numacopy_affinity {
+	const char *name;
+	const int affinity;
+} stress_numacopy_affinity_t;
+
+static const stress_numacopy_mode_t stress_numacopy_modes[] = {
+#if defined(MPOL_BIND)
+	{ "bind", MPOL_BIND },
+#endif
+#if defined(MPOL_INTERLEAVE)
+	{ "interleave", MPOL_INTERLEAVE },
+#endif
+#if defined(MPOL_PREFERRED)
+	{ "preferred", MPOL_PREFERRED },
+#endif
+#if defined(MPOL_WEIGHTED_INTERLEAVE)
+	{ "weighted-interleave", MPOL_WEIGHTED_INTERLEAVE },
+#endif
+};
+
+static const stress_numacopy_affinity_t stress_numacopy_affinities[] = {
+	{ "next",	NUMACOPY_AFFINITY_NEXT },
+	{ "none",	NUMACOPY_AFFINITY_NONE },
+	{ "node",	NUMACOPY_AFFINITY_NODE },
+	{ "prev",	NUMACOPY_AFFINITY_PREV },
+	{ "random",	NUMACOPY_AFFINITY_RANDOM },
+};
+
+static const char *stress_numacopy_mode(const size_t i)
+{
+	return (i <  SIZEOF_ARRAY(stress_numacopy_modes)) ? stress_numacopy_modes[i].name : NULL;
+}
+
+static const char *stress_numacopy_affinity(const size_t i)
+{
+	return (i <  SIZEOF_ARRAY(stress_numacopy_affinities)) ? stress_numacopy_affinities[i].name : NULL;
+}
+
+static const stress_opt_t opts[] = {
+	{ OPT_numacopy_affinity, "numacopy-affinity", TYPE_ID_SIZE_T_METHOD, 0, 0, stress_numacopy_affinity },
+	{ OPT_numacopy_mode,     "numacopy-mode",     TYPE_ID_SIZE_T_METHOD, 0, 0, stress_numacopy_mode },
+	END_OPT,
+};
+
+#if defined(__NR_mbind)
+/*
+ *  stress_numacopy_exercise()
+ *	exercise page copying across NUMA nodes
+ */
+static void TARGET_CLONES stress_numacopy_exercise(
+	stress_args_t *args,
+	const size_t page_size,
+	register const long int num_numa_nodes,
+	uint8_t * const local_page,
+	uint8_t ** const numa_pages,
+	stress_numacopy_metric_t * const metrics,
+	double * const duration,
+	double * const numa_pages_memcpy,
+	double * const numa_pages_memset,
+	const int32_t max_cpus,
+	const int affinity,
+	stress_numacopy_cpus_t *numa_cpus)
+{
+	long int node_from;
+	long int node_to;
+	long int node;
+	uint8_t val = stress_mwc8();
+	static double time_prev = -1.0;
+	const double time_now = stress_time_now();
+	bool change_affinity;
+
+	/* Change every interval */
+	if (UNLIKELY((time_now - time_prev) > NUMACOPY_AFFINIY_INTERVAL)) {
+		change_affinity = true;
+		time_prev = time_now;
+	} else {
+		change_affinity = false;
+	}
+
+	node = 0;
+	for (node_from = 0; node_from < num_numa_nodes; node_from++) {
+		register uint8_t * const numa_pages_from = numa_pages[node_from];
+
+
+#if defined(HAVE_SCHED_GETAFFINITY) &&  \
+    defined(HAVE_SCHED_SETAFFINITY)
+		if (change_affinity) {
+			cpu_set_t mask;
+			size_t idx;
+			uint32_t cpu;
+			uint32_t start_cpu;
+			long int node_next;
+			long int node_prev;
+
+			switch (affinity) {
+			case NUMACOPY_AFFINITY_NODE:
+				/* Pick next one from cpus associated with the node */
+				idx = numa_cpus[node_from].index;
+				cpu = numa_cpus[node_from].cpus[idx];
+
+				idx++;
+				if (idx >= numa_cpus[node_from].count)
+					idx = 0;
+				numa_cpus[node_from].index = idx;
+
+				CPU_ZERO(&mask);
+				CPU_SET(cpu, &mask);
+				(void)sched_setaffinity(0, sizeof(mask), &mask);
+				break;
+			case NUMACOPY_AFFINITY_NEXT:
+				node_next = node_from + 1;
+				if (node_next >= num_numa_nodes)
+					node_next = 0;
+				if (numa_cpus[node_next].count > 0) {
+					/* Pick cpus from cpus associated with the next node */
+					cpu = numa_cpus[node_next].cpus[0];
+				} else  {
+					/* Pick random cpu */
+					cpu = stress_mwc32modn((uint32_t)max_cpus);
+				}
+
+				start_cpu = cpu;
+				/* avoid using a CPU on the NUMA node */
+				for (idx = 0; idx < numa_cpus[node_from].count; idx++) {
+					if (numa_cpus[node_from].cpus[idx] == cpu) {
+						cpu++;
+						if (cpu >= (uint32_t)max_cpus)
+							cpu = 0;
+					}
+				}
+				if (cpu == start_cpu) {
+					/* Wrapped, so just randomize */
+					cpu = stress_mwc32modn((uint32_t)max_cpus);
+				}
+				CPU_ZERO(&mask);
+				CPU_SET(cpu, &mask);
+				(void)sched_setaffinity(0, sizeof(mask), &mask);
+				break;
+			case NUMACOPY_AFFINITY_PREV:
+				node_prev = node_from - 1;
+				if (node_prev < 0)
+					node_prev = num_numa_nodes - 1;
+				if (numa_cpus[node_prev].count > 0) {
+					/* Pick cpus associated with the previous node */
+					cpu = numa_cpus[node_prev].cpus[0];
+				} else  {
+					/* Pick random cpu */
+					cpu = stress_mwc32modn((uint32_t)max_cpus);
+				}
+
+				start_cpu = cpu;
+				/* avoid using a CPU on the NUMA node */
+				for (idx = 0; idx < numa_cpus[node_from].count; idx++) {
+					if (numa_cpus[node_from].cpus[idx] == cpu) {
+						cpu++;
+						if (cpu >= (uint32_t)max_cpus)
+							cpu = 0;
+					}
+				}
+				if (cpu == start_cpu) {
+					/* Wrapped, so just randomize */
+					cpu = stress_mwc32modn((uint32_t)max_cpus);
+				}
+				CPU_ZERO(&mask);
+				CPU_SET(cpu, &mask);
+				(void)sched_setaffinity(0, sizeof(mask), &mask);
+				break;
+			case NUMACOPY_AFFINITY_RANDOM:
+				cpu = stress_mwc32modn((uint32_t)max_cpus);
+				CPU_ZERO(&mask);
+				CPU_SET(cpu, &mask);
+				(void)sched_setaffinity(0, sizeof(mask), &mask);
+				break;
+			default:
+				break;
+			}
+		}
+#endif
+
+		for (node_to = 0; node_to < num_numa_nodes; node_to++) {
+			double t = stress_time_now();
+			double dt;
+			register int j;
+			register uint8_t * const numa_pages_to = numa_pages[node_to];
+
+			for (j = 0; j < STRESS_NUMACOPY_LOOPS; j++) {
+				/* fill local page, copy to node_from, copy node_from to node_to */
+				(void)shim_memset(local_page, val, page_size);
+				(void)shim_memcpy(numa_pages_from, local_page, page_size);
+				(void)shim_memcpy(numa_pages_to, numa_pages_from, page_size);
+				if (*numa_pages_to != val)
+					pr_inf("%s: invalid value in node data %ld\n", args->name, node_to);
+				val++;
+
+				/* fill local page, copy to node_to, copy node_to to node_from */
+				(void)shim_memset(local_page, val, page_size);
+				(void)shim_memcpy(numa_pages_to, local_page, page_size);
+				(void)shim_memcpy(numa_pages_from, numa_pages_to, page_size);
+				if (*numa_pages_from != val)
+					pr_inf("%s: invalid value in node data %ld\n", args->name, node_from);
+				val++;
+			}
+			dt = stress_time_now() - t;
+			(*duration) += dt;
+			metrics[node++].duration += dt;
+		}
+	}
+	(*numa_pages_memset) += 2.0 * (double)STRESS_NUMACOPY_LOOPS;
+	(*numa_pages_memcpy) += 4.0 * (double)STRESS_NUMACOPY_LOOPS;
+	stress_bogo_inc(args);
+}
+
+
+/*
+ *  stress_numacopy_affinity_supported()
+ *      check that we can set affinity
+ */
+static int stress_numacopy_affinity_supported(const char *name)
+{
+#if defined(HAVE_SCHED_GETAFFINITY) &&  \
+    defined(HAVE_SCHED_SETAFFINITY)
+	cpu_set_t mask;
+
+	CPU_ZERO(&mask);
+
+	if (sched_getaffinity(0, sizeof(mask), &mask) < 0) {
+		pr_inf("%s: cannot get CPU affinity, ignoring option --numacopy-affinity", name);
+		return -1;
+	}
+	if (sched_setaffinity(0, sizeof(mask), &mask) < 0) {
+		if (errno == EPERM) {
+			pr_inf("%s: cannot set CPU affinity, ignoring option --numacopy-affinity", name);
+			return -1;
+		}
+	}
+	return 0;
+#else
+	pr_inf("%s: cannot set CPU affinity, ignoring option --numacopy-affinity", name);
+#endif
+}
+
+/*
+ *  stress_numanode_cpus()
+ *	determine cpus assicoated with each NUMA node
+ */
+static int stress_numanode_cpus(
+	stress_args_t *args,
+	const int32_t max_cpus,
+	const long int num_numa_nodes,
+	stress_numacopy_cpus_t *numa_cpus)
+{
+	long int node;
+	uint32_t *cpus;
+
+	cpus = (uint32_t *)calloc((size_t)max_cpus, sizeof(*cpus));
+	if (!cpus) {
+		pr_inf_skip("%s: allocate %" PRId32 " cpu entries failed, skipping stressor", args->name, max_cpus);
+		return -1;
+	}
+
+	/* Default to no CPUs associated for each node */
+	for (node = 0; node < num_numa_nodes; node++) {
+		numa_cpus[node].count = 0;
+		numa_cpus[node].cpus = NULL;
+		numa_cpus[node].index = 0;
+	}
+
+	/* Parse /sys/devices/system/node/node%ld/cpulist */
+	for (node = 0; node < num_numa_nodes; node++) {
+		char path[PATH_MAX];
+		char buffer[4096];
+		char *ptr;
+		const char *numptr;
+		int cpu;
+		int cpu_end;
+		int count;
+
+		(void)snprintf(path, sizeof(path), "/sys/devices/system/node/node%ld/cpulist", node);
+
+		if (stress_fs_file_read(path, buffer, sizeof(buffer)) < 1) {
+			pr_inf_skip("%s: read '%s' failed, skipping stressor\n", args->name, path);
+			free(cpus);
+			return -1;
+		}
+
+		count = 0;
+		ptr = buffer;
+		cpu_end = -1;
+		while (*ptr) {
+			int cpu_begin;
+
+			if (!isdigit((int)*ptr))
+				break;
+			numptr = ptr;
+			while (isdigit((int)*ptr))
+				ptr++;
+			cpu_begin = atoi(numptr);
+			if ((cpu_begin < 0) || (cpu_begin >= (int)max_cpus)) {
+				pr_inf_skip("%s: bad cpu value %s in '%s', skipping stressor\n",
+					args->name, numptr, path);
+				free(cpus);
+				return -1;
+			}
+
+			if (*ptr == '\0' || *ptr == ',') {
+				cpu_end = cpu_begin;
+			} else if (*ptr == '-') {
+				ptr++;
+				numptr = ptr;
+				cpu_end = cpu_begin;
+
+				while (isdigit((int)*ptr))
+					ptr++;
+				if (ptr > numptr) {
+					cpu_end = atoi(numptr);
+					if ((cpu_end < 0) || (cpu_end >= (int)max_cpus)) {
+						pr_inf_skip("%s: bad cpu value %s in '%s', skipping stressor\n",
+							args->name, numptr, path);
+						free(cpus);
+						return -1;
+					}
+				}
+			}
+			for (cpu = cpu_begin; cpu <= cpu_end; cpu++) {
+				if (cpu >= max_cpus)
+					break;
+				cpus[count] = cpu;
+				count++;
+			}
+		}
+		numa_cpus[node].cpus = calloc((size_t)count, sizeof(*numa_cpus[node].cpus));
+		if (!numa_cpus[node].cpus) {
+			free(cpus);
+			return -1;
+		}
+		numa_cpus[node].count = (size_t)count;
+		for (cpu = 0; cpu < count; cpu++)
+			numa_cpus[node].cpus[cpu] = cpus[cpu];
+	}
+	free(cpus);
+	return 0;
+}
+
+/*
+ *  stress_numacopy()
+ *	stress copying data between NUMA nodes
+ */
+static int stress_numacopy(stress_args_t *args)
+{
+	stress_numa_mask_t *numa_mask;
+	stress_numa_mask_t *numa_nodes;
+	const size_t page_size = args->page_size;
+	size_t numa_bytes;
+	size_t numa_pages_size;
+	int rc = EXIT_FAILURE, mode;
+	uint8_t **numa_pages;
+	uint8_t *local_page;
+	long int i;
+	long int node;
+	long int num_numa_nodes;
+	long int num_numa_nodes_squared;
+	const int32_t max_cpus = stress_cpus_configured_get();
+	size_t idx;
+	size_t numacopy_mode_index = 0;
+	size_t numacopy_affinity_index = 1;
+	int affinity = NUMACOPY_AFFINITY_NONE;
+	double numa_pages_memcpy = 0.0;
+	double numa_pages_memset = 0.0;
+	double duration = 0.0;
+	double rate = 0.0;
+	double max_rate;
+	double scale;
+	stress_numacopy_metric_t *metrics;
+	stress_numacopy_cpus_t *numa_cpus = NULL;
+
+	(void)stress_setting_get("numacopy-mode", &numacopy_mode_index);
+	mode = stress_numacopy_modes[numacopy_mode_index].mode;
+	if (stress_setting_get("numacopy-affinity", &numacopy_affinity_index))
+		affinity = stress_numacopy_affinities[numacopy_affinity_index].affinity;
+	if ((numacopy_affinity_index != NUMACOPY_AFFINITY_NONE) &&
+	    (stress_numacopy_affinity_supported(args->name) < 0))
+		    affinity = NUMACOPY_AFFINITY_NONE;
+
+	numa_nodes = stress_numa_mask_alloc();
+	if (!numa_nodes) {
+		pr_inf_skip("%s: no NUMA nodes found, skipping stressor\n", args->name);
+		rc = EXIT_NO_RESOURCE;
+		goto deinit;
+	}
+	num_numa_nodes = stress_numa_mask_nodes_get(numa_nodes);
+	if (num_numa_nodes < 1) {
+		pr_inf_skip("%s: no NUMA nodes found, skipping stressor\n", args->name);
+		rc = EXIT_NO_RESOURCE;
+		goto numa_nodes_free;
+	}
+	numa_mask = stress_numa_mask_alloc();
+	if (!numa_mask) {
+		pr_inf_skip("%s: no NUMA nodes found, skipping stressor\n", args->name);
+		rc = EXIT_NO_RESOURCE;
+		goto numa_nodes_free;
+	}
+
+	if (num_numa_nodes > NUMA_NODES_MAX) {
+		if (stress_instance_zero(args))
+			pr_inf("%s: too many NUMA nodes, using just %ld of %ld NUMA nodes\n", args->name, NUMA_NODES_MAX, num_numa_nodes);
+		num_numa_nodes = NUMA_NODES_MAX;
+		num_numa_nodes_squared = NUMA_NODES_MAX * NUMA_NODES_MAX;
+	} else {
+		if (stress_instance_zero(args))
+			pr_inf("%s: using %ld NUMA nodes\n", args->name, num_numa_nodes);
+		num_numa_nodes_squared = num_numa_nodes * num_numa_nodes;
+	}
+
+	if (affinity != NUMACOPY_AFFINITY_NONE) {
+		numa_cpus = calloc((size_t)max_cpus, sizeof(*numa_cpus));
+		if (!numa_cpus) {
+			pr_inf_skip("%s: cannot allocate %" PRId32 " NUMA CPU structures, "
+				"skipping stressor\n", args->name, max_cpus);
+			rc = EXIT_NO_RESOURCE;
+			goto numa_mask_free;
+		}
+		if (stress_numanode_cpus(args, max_cpus, num_numa_nodes, numa_cpus) < 0) {
+			rc = EXIT_NO_RESOURCE;
+			goto numa_cpus_free;
+		}
+	}
+
+	metrics = (stress_numacopy_metric_t *)calloc(num_numa_nodes_squared, sizeof(*metrics));
+	if (!metrics) {
+		pr_inf_skip("%s: failed to allocate numa metrics array, skipping strssor\n", args->name);
+		rc = EXIT_NO_RESOURCE;
+		goto numa_cpus_free;
+	}
+	for (i = 0; i < num_numa_nodes_squared; i++) {
+		metrics[i].duration = 0.0;
+		metrics[i].rate = 0.0;
+	}
+
+	numa_pages_size = (size_t)num_numa_nodes * sizeof(*numa_pages);
+	numa_bytes = (args->page_size * (size_t)(num_numa_nodes + 1)) +
+		((numa_pages_size + page_size - 1) & ~(page_size - 1));
+	if (stress_instance_zero(args))
+		stress_memory_usage_get(args, numa_bytes, numa_bytes * args->instances);
+
+	numa_pages = (uint8_t **)stress_mmap_populate(NULL, numa_pages_size,
+					PROT_READ | PROT_WRITE,
+					MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+	if (numa_pages == MAP_FAILED) {
+		pr_inf_skip("%s: failed to mmap pages array of %ld elements%s, "
+			"errno=%d (%s), skipping stressor\n",
+			args->name, num_numa_nodes,
+			stress_memory_free_get(), errno, strerror(errno));
+		rc = EXIT_NO_RESOURCE;
+		goto metrics_free;
+	}
+	stress_memory_anon_name_set(numa_pages, numa_pages_size, "pages");
+
+	local_page = (uint8_t *)stress_mmap_populate(NULL, page_size,
+					PROT_READ | PROT_WRITE,
+					MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+	if (local_page == MAP_FAILED) {
+		pr_inf_skip("%s: failed to mmap a local page%s, "
+			"errno=%d (%s), skipping stressor\n",
+			args->name,
+			stress_memory_free_get(), errno, strerror(errno));
+		rc = EXIT_NO_RESOURCE;
+		goto numa_pages_free;
+	}
+	stress_memory_anon_name_set(numa_pages, numa_pages_size, "pages");
+
+	for (node = 0; node < num_numa_nodes; node++) {
+		long lret;
+
+		numa_pages[node] = mmap(NULL, page_size, PROT_READ | PROT_WRITE,
+					MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+		if (numa_pages[node] == MAP_FAILED) {
+			numa_pages[node] = NULL;
+			goto local_page_free;
+		}
+
+		STRESS_SETBIT(numa_mask->mask, node);
+		lret = shim_mbind(numa_pages[node], (unsigned long int)page_size, mode, numa_mask->mask,
+				numa_mask->max_nodes, MPOL_MF_MOVE | MPOL_MF_STRICT);
+		if (UNLIKELY(lret < 0)) {
+			if (errno == ENOSYS) {
+				pr_inf_skip("%s: mbind not availed, errno=%d (%s), skipping stressor\n",
+					args->name, errno, strerror(errno));
+				rc = EXIT_NO_RESOURCE;
+				goto err;
+			}
+			pr_fail("%s: mbind to node %ld using MPOL_MF_MOVE failed, errno=%d (%s)\n",
+				args->name, node, errno, strerror(errno));
+			goto err;
+		}
+		(void)shim_memset(numa_pages[node], 0xff, page_size);
+	}
+
+	stress_proc_state_set(args->name, STRESS_STATE_SYNC_WAIT);
+	stress_sync_start_wait(args);
+	stress_proc_state_set(args->name, STRESS_STATE_RUN);
+
+	do {
+		stress_numacopy_exercise(args, page_size, num_numa_nodes,
+					local_page, numa_pages, metrics,
+					&duration, &numa_pages_memcpy,
+					&numa_pages_memset,
+					max_cpus, affinity, numa_cpus);
+	} while (stress_continue(args));
+
+	if (stress_instance_zero(args)) {
+		static const char * const scales[] = {
+			"",
+			"thousands of ",
+			"millions of ",		/* likely */
+			"billions of ",		/* unlikely */
+			"trillions of ",	/* very unlikely! */
+		};
+
+		for (max_rate = 0.0, i = 0; i < num_numa_nodes_squared; i++) {
+			const double dur = metrics[i].duration;
+
+			rate = (dur > 0.0) ? numa_pages_memcpy / dur : 0.0;
+			metrics[i].rate = rate;
+			if (max_rate < rate)
+				max_rate = rate;
+		}
+
+		rate = max_rate;
+		scale = 1.0;
+		for (idx = 0; (rate > 100.0) && (idx < SIZEOF_ARRAY(scales)); idx++) {
+			rate = rate / 1000.0;
+			scale = scale * 1000.0;
+		}
+		if (idx >= SIZEOF_ARRAY(scales)) {
+			pr_inf("%s: page copy rate out of range, cannot report "
+				"node copying rates\n", args->name);
+		} else if (duration > 0.0) {
+			long int node_from, node_to;
+			char str[7 + (num_numa_nodes * 6)];
+			char buf[7];
+
+			pr_block_begin();
+			pr_inf("%s: %s%zdKB page copies to/from each node per second (for instance 0):\n",
+				args->name, scales[idx], page_size >> 10);
+			*str = '\0';
+			for (node = 0; node < num_numa_nodes; node++) {
+				(void)snprintf(buf, sizeof(buf), " %5.0f", (double)node);
+				(void)shim_strlcat(str, buf, sizeof(str));
+			}
+			pr_inf("%s: node%s\n", args->name, str);
+			node = 0;
+			for (node_from = 0; node_from < num_numa_nodes; node_from++) {
+				(void)snprintf(str, sizeof(str), "%4.0f", (double)node_from);
+
+				for (node_to = 0; node_to < num_numa_nodes; node_to++) {
+					(void)snprintf(buf, sizeof(buf), " %5.1f", metrics[node].rate / scale);
+					(void)shim_strlcat(str, buf, sizeof(str));
+					node++;
+				}
+				pr_inf("%s: %s\n", args->name, str);
+			}
+			pr_block_end();
+		}
+	}
+
+	numa_pages_memset *= (double)num_numa_nodes_squared;
+	numa_pages_memcpy *= (double)num_numa_nodes_squared;
+
+	rate = duration > 0.0 ? numa_pages_memset / duration : 0.0;
+	stress_metrics_set(args, "numa_pages filled per sec", rate, STRESS_METRIC_GEOMETRIC_MEAN);
+	rate = duration > 0.0 ? numa_pages_memcpy / duration : 0.0;
+	stress_metrics_set(args, "pages copied per sec", rate, STRESS_METRIC_GEOMETRIC_MEAN);
+
+	rc = EXIT_SUCCESS;
+err:
+	stress_proc_state_set(args->name, STRESS_STATE_DEINIT);
+
+local_page_free:
+	(void)munmap((void *)local_page, page_size);
+numa_pages_free:
+	for (node = 0; node < num_numa_nodes; node++) {
+		if (numa_pages[node])
+			(void)munmap((void *)numa_pages[node], page_size);
+	}
+	(void)munmap((void *)numa_pages, numa_pages_size);
+metrics_free:
+	free(metrics);
+numa_cpus_free:
+	if (numa_cpus) {
+		int32_t j;
+
+		for (j = 0; j < max_cpus; j++) {
+			if (numa_cpus[j].cpus)
+				free(numa_cpus[j].cpus);
+		}
+		free(numa_cpus);
+	}
+numa_mask_free:
+	stress_numa_mask_free(numa_mask);
+numa_nodes_free:
+	stress_numa_mask_free(numa_nodes);
+deinit:
+	stress_proc_state_set(args->name, STRESS_STATE_DEINIT);
+
+	return rc;
+}
+
+static const stress_exercises_t exercises[] = {
+	STRESS_EX_FEATURE("d-tlb-read-miss"),
+	STRESS_EX_FEATURE("memory-bus"),
+	STRESS_EX_FEATURE("memory-copy"),
+	STRESS_EX_FEATURE("memory-stores"),
+	STRESS_EX_FEATURE("user-time"),
+
+#if defined(HAVE_SCHED_GETAFFINITY)
+	STRESS_EX_SYSCALL("sched_getaffinity"),
+#endif
+#if defined(HAVE_SCHED_SETAFFINITY)
+	STRESS_EX_SYSCALL("sched_setaffinity"),
+#endif
+
+	STRESS_EX_END,
+};
+
+const stressor_info_t stress_numacopy_info = {
+	.stressor = stress_numacopy,
+	.classifier = CLASS_CPU | CLASS_MEMORY | CLASS_OS,
+	.verify = VERIFY_ALWAYS,
+	.opts = opts,
+	.help = help,
+	.exercises = exercises,
+};
+#else
+const stressor_info_t stress_numacopy_info = {
+	.stressor = stress_unimplemented,
+	.classifier = CLASS_CPU | CLASS_MEMORY | CLASS_OS,
+	.verify = VERIFY_ALWAYS,
+	.opts = opts,
+	.help = help,
+	.unimplemented_reason = "built without linux/mempolicy.h or mbind()"
+};
+#endif

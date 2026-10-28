@@ -1,0 +1,497 @@
+/*
+ * Copyright (C) 2013-2021 Canonical, Ltd.
+ * Copyright (C) 2022-2026 Colin Ian King.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
+ *
+ */
+#include "stress-ng.h"
+#include "core-builtin.h"
+#include "core-killpid.h"
+#include "core-madvise.h"
+#include "core-mmap.h"
+#include "core-out-of-memory.h"
+#include "core-put.h"
+#include "core-pragma.h"
+#include "core-signal.h"
+
+#if defined(HAVE_SYS_AUXV_H)
+#include <sys/auxv.h>
+#endif
+
+#define STRESS_BAD_ALTSTACK_SIZE	(65536)
+
+static const stress_help_t help[] =
+{
+	{ NULL,	"bad-altstack N",	"start N workers exercising bad signal stacks" },
+	{ NULL,	"bad-altstack-ops N",	"stop after N bogo signal stack SIGSEGVs" },
+	{ NULL, NULL,			NULL }
+};
+
+#if defined(HAVE_SYS_AUXV_H) && \
+    defined(HAVE_GETAUXVAL) && \
+    defined(AT_SYSINFO_EHDR)
+#define HAVE_VDSO_VIA_GETAUXVAL	(1)
+#endif
+
+#if defined(HAVE_SIGALTSTACK) &&	\
+    defined(HAVE_SIGLONGJMP) &&		\
+    defined(HAVE_MPROTECT) &&		\
+    defined(PROT_NONE) &&		\
+    defined(PROT_EXEC) &&		\
+    defined(PROT_READ) &&		\
+    defined(PROT_WRITE)
+
+/* guarded stack is guard page + stack + guard page */
+static uint8_t *guarded_stack;
+static size_t guarded_stack_size;
+
+/* stack is guarded_stack + guard page offset */
+static void *stack;
+static size_t stack_size;
+
+static void *zero_stack;
+#if defined(O_TMPFILE)
+static void *bus_stack;
+#endif
+static sigjmp_buf jmp_env;
+
+STRESS_PRAGMA_PUSH
+STRESS_PRAGMA_WARN_OFF
+static void stress_bad_altstack_force_fault(void *stack_start)
+{
+	volatile uint8_t *vol_stack = (volatile uint8_t *)stack_start;
+	/* trigger segfault on stack */
+
+	stress_put_uint8(*vol_stack);	/* cppcheck-suppress nullPointer */
+	*vol_stack = 0;			/* cppcheck-suppress nullPointer */
+	(void)*vol_stack;		/* cppcheck-suppress nullPointer */
+}
+STRESS_PRAGMA_POP
+
+static void NORETURN MLOCKED_TEXT stress_bad_altstack_signal_handler(int signum)
+{
+	uint8_t data[STRESS_BAD_ALTSTACK_SIZE];
+	const int saved_errno = errno;
+
+	/*
+	 * Linux does not allow setting the alternative stack
+	 * while in this context. Not sure if this is portable
+	 * so ignore this for now.
+	{
+		VOID_RET(int, stress_stack_sigalt_no_check(stack, STRESS_BAD_ALTSTACK_SIZE));
+	}
+	 */
+
+	(void)munmap(stack, stack_size);
+	(void)shim_memset(data, 0xff, sizeof(data));
+	stress_put_uint8(data[0]);
+
+	if (zero_stack != MAP_FAILED)
+		(void)munmap(zero_stack, stack_size);
+#if defined(O_TMPFILE)
+	if (bus_stack != MAP_FAILED)
+		(void)munmap(bus_stack, stack_size);
+#else
+	UNEXPECTED
+#endif
+	errno = saved_errno;
+	/*
+	 *  If we've not got this far we've not
+	 *  generated a fault inside the stack of the
+	 *  signal handler, so jmp back and re-try
+	 */
+	stress_signal_siglongjmp(signum, jmp_env, 1);
+}
+
+static int stress_bad_altstack_child(stress_args_t *args)
+{
+#if defined(HAVE_VDSO_VIA_GETAUXVAL)
+	unsigned long int vdso = getauxval(AT_SYSINFO_EHDR);
+#else
+	UNEXPECTED
+#endif
+	CLOBBERED uint32_t rnd;
+	int i;
+	int ret;
+	stack_t ss;
+	stack_t	old_ss;
+#if defined(SIGXCPU) &&		\
+    defined(HAVE_SETRLIMIT) &&	\
+    defined(RLIMIT_CPU)
+	struct rlimit rlim;
+#endif
+	void *func_ptr = (void *)stress_stack_sigalt_no_check;
+	void *last_page = (void *)~(uintptr_t)(args->page_size - 1);
+
+	if (sigsetjmp(jmp_env, 1) != 0) {
+		/*
+		 *  We land here if we get a segfault
+		 *  but not a segfault in the sighandler
+		 *  ..bail out fast as we can
+		 */
+		if (UNLIKELY(!stress_continue(args)))
+			_exit(EXIT_SUCCESS);
+	}
+
+	/* Exercise fetch of old ss, return 0 */
+	(void)sigaltstack(NULL, &old_ss);
+
+	/* Exercise disable SS_DISABLE */
+	ss.ss_sp = stress_memory_address_align(stack, STACK_ALIGNMENT);
+	ss.ss_size = stack_size;
+	ss.ss_flags = SS_DISABLE;
+	(void)sigaltstack(&ss, NULL);
+
+	/* Exercise invalid flags */
+	ss.ss_sp = stress_memory_address_align(stack, STACK_ALIGNMENT);
+	ss.ss_size = stack_size;
+	ss.ss_flags = ~0;
+	(void)sigaltstack(&ss, NULL);
+
+	/* Exercise no-op, return 0 */
+	(void)sigaltstack(NULL, NULL);
+
+	/* Exercise less than minimum allowed stack size, ENOMEM */
+	ss.ss_sp = stress_memory_address_align(stack, STACK_ALIGNMENT);
+	ss.ss_size = stack_size - 1;
+	ss.ss_flags = 0;
+	(void)sigaltstack(&ss, NULL);
+
+#if defined(SIGSEGV)
+	if (stress_signal_handler(args->name, SIGSEGV, stress_bad_altstack_signal_handler, NULL) < 0)
+		return EXIT_NO_RESOURCE;
+#endif
+#if defined(SIGBUS)
+	if (stress_signal_handler(args->name, SIGBUS, stress_bad_altstack_signal_handler, NULL) < 0)
+		return EXIT_NO_RESOURCE;
+#endif
+#if defined(SIGILL)
+	/* Some BSD kernels trigger SIGILL on bad alternative stack jmps */
+	if (stress_signal_handler(args->name, SIGILL, stress_bad_altstack_signal_handler, NULL) < 0)
+		return EXIT_NO_RESOURCE;
+#endif
+#if defined(SIGXCPU) &&		\
+    defined(HAVE_SETRLIMIT) &&	\
+    defined(RLIMIT_CPU)
+	if (stress_signal_handler(args->name, SIGXCPU, stress_signal_exit_handler, NULL) < 0)
+		return EXIT_NO_RESOURCE;
+
+	rlim.rlim_cur = 1;
+	rlim.rlim_max = 1;
+	(void)setrlimit(RLIMIT_CPU, &rlim);
+#else
+	UNEXPECTED
+#endif
+
+	/* Set alternative stack for testing */
+	if (stress_stack_sigalt_no_check(stack, stack_size) < 0) {
+		/*
+		 *  Pretend it's all OK, for example OpenBSD can fail
+		 *  depending on the stack setting on some of test cases
+		 *  so don't flag it's a failure per se
+		 */
+		return EXIT_SUCCESS;
+	}
+
+	/* Child */
+	stress_mwc_reseed();
+
+	stress_set_oom_adjustment(args, true);
+	stress_process_dumpable(false);
+	(void)stress_sched_settings_apply(true);
+
+	for (i = 0; i < 10; i++) {
+retry:
+		if (UNLIKELY(!stress_continue(args)))
+			return EXIT_SUCCESS;
+		rnd = stress_mwc32modn(11);
+		switch (rnd) {
+		case 1:
+			/* Illegal stack with no protection */
+			ret = mprotect(stack, stack_size, PROT_NONE);
+			if (ret == 0)
+				stress_bad_altstack_force_fault(stack);
+			goto retry;
+		case 2:
+			/* Illegal read-only stack */
+			ret = mprotect(stack, stack_size, PROT_READ);
+			if (ret == 0)
+				stress_bad_altstack_force_fault(stack);
+			goto retry;
+		case 3:
+			/* Illegal exec-only stack */
+			ret = mprotect(stack, stack_size, PROT_EXEC);
+			if (ret == 0)
+				stress_bad_altstack_force_fault(stack);
+			goto retry;
+		case 4:
+			/* Illegal write-only stack */
+			ret = mprotect(stack, stack_size, PROT_WRITE);
+			if (ret == 0)
+				stress_bad_altstack_force_fault(stack);
+			goto retry;
+		case 5:
+			/* Illegal NULL stack */
+			ret = stress_stack_sigalt_no_check(NULL, STRESS_SIGSTKSZ);
+			if (ret == 0)
+				stress_bad_altstack_force_fault(stack);
+			goto retry;
+		case 6:
+			/* Illegal text segment stack */
+			ret = stress_stack_sigalt_no_check(func_ptr, STRESS_SIGSTKSZ);
+			if (ret == 0)
+				stress_bad_altstack_force_fault(stack);
+			goto retry;
+		case 7:
+#if defined(HAVE_VDSO_VIA_GETAUXVAL)
+			/* Illegal stack on VDSO, otherwises NULL stack */
+			if (vdso) {
+				ret = stress_stack_sigalt_no_check((void *)vdso, STRESS_SIGSTKSZ);
+				if (ret == 0)
+					stress_bad_altstack_force_fault(stack);
+			}
+#endif
+			goto retry;
+		case 8:
+			/* Illegal /dev/zero mapped stack */
+			if (zero_stack != MAP_FAILED) {
+				ret = stress_stack_sigalt_no_check(zero_stack, stack_size);
+				if (ret == 0)
+					stress_bad_altstack_force_fault(zero_stack);
+			}
+			goto retry;
+		case 9:
+#if defined(O_TMPFILE)
+			/* Illegal mapped stack to empty file, causes BUS error */
+			if (bus_stack != MAP_FAILED) {
+				ret = stress_stack_sigalt_no_check(bus_stack, stack_size);
+				if (ret == 0)
+					stress_bad_altstack_force_fault(bus_stack);
+			}
+#endif
+			goto retry;
+		case 10:
+			/* Illegal last page */
+			stress_bad_altstack_force_fault(last_page);
+			goto retry;
+		default:
+		case 0:
+			/* Illegal unmapped stack */
+			(void)munmap(stack, stack_size);
+			stress_bad_altstack_force_fault(g_shared->null_ptr);
+			break;
+		}
+	}
+	/* No luck, well that's unexpected.. */
+	if (UNLIKELY(!stress_continue(args)))
+		pr_fail("%s: child process with illegal stack unexpectedly worked, %" PRIu32 "\n",
+			args->name, rnd);
+	return EXIT_FAILURE;
+}
+
+/*
+ *  stress_bad_altstack()
+ *	create bad alternative signal stacks and cause
+ *	a SIGSEGV when handling SIGSEGVs. The kernel
+ *	should kill these.
+ */
+static int stress_bad_altstack(stress_args_t *args)
+{
+	int fd;
+	int rc = EXIT_SUCCESS;
+#if defined(O_TMPFILE)
+	int tmp_fd;
+#endif
+#if defined(MAP_STACK)
+	const int map_stackflags = MAP_STACK;
+#else
+	const int map_stackflags = 0;
+#endif
+	const size_t page_size = args->page_size;
+	/* min_stack_size must be at least a page size */
+	const size_t min_stack_size = STRESS_MAXIMUM((size_t)STRESS_MINSIGSTKSZ, page_size);
+
+	guarded_stack_size = (size_t)min_stack_size + (page_size * 2);
+	stack_size = min_stack_size;
+	stress_set_oom_adjustment(args, true);
+
+	guarded_stack = (uint8_t *)stress_mmap_populate(NULL, guarded_stack_size,
+			PROT_READ | PROT_WRITE,
+			MAP_PRIVATE | MAP_ANONYMOUS | map_stackflags, -1, 0);
+	if (guarded_stack == MAP_FAILED) {
+		pr_inf_skip("%s: cannot mmap %zu byte signal handler stack%s, "
+			    "errno=%d (%s), skipping stressor\n",
+			args->name, guarded_stack_size,
+			stress_memory_free_get(), errno, strerror(errno));
+		return EXIT_NO_RESOURCE;
+	}
+	stress_memory_anon_name_set(guarded_stack, guarded_stack_size, "altstack");
+	(void)stress_madvise_mergeable(guarded_stack, guarded_stack_size);
+
+	/* Make ends of stack PROT_NONE */
+	(void)mprotect((void *)guarded_stack, page_size, PROT_NONE);
+	(void)mprotect((void *)(guarded_stack + page_size + stack_size), page_size, PROT_NONE);
+
+	/* Stack starts at first read-writeable page */
+	stack = guarded_stack + page_size;
+
+
+#if defined(O_TMPFILE)
+	tmp_fd = open(stress_fs_temp_path_get(), O_TMPFILE | O_RDWR, S_IRUSR | S_IWUSR);
+	if (tmp_fd < 0) {
+		bus_stack = MAP_FAILED;
+	} else {
+		bus_stack = stress_mmap_populate(NULL,
+				stack_size,
+				PROT_READ | PROT_WRITE,
+				MAP_PRIVATE | map_stackflags, tmp_fd, 0);
+		(void)close(tmp_fd);
+		if (bus_stack != MAP_FAILED)
+			stress_memory_anon_name_set(bus_stack, stack_size, "altstack-bus-errors");
+	}
+#else
+	UNEXPECTED
+#endif
+
+	fd = open("/dev/zero", O_RDONLY);
+	if (fd < 0) {
+		zero_stack = MAP_FAILED;
+	} else {
+		zero_stack = stress_mmap_populate(NULL,
+			stack_size, PROT_READ,
+			MAP_PRIVATE, fd, 0);
+		(void)close(fd);
+		if (zero_stack != MAP_FAILED)
+			stress_memory_anon_name_set(zero_stack, stack_size, "altstack-zero-ro");
+	}
+
+	/*
+	 *  Ensure that mumap is fixed up by the dynamic loader
+	 *  before it needs to be called in the signal handler.
+	 *  If the alternative stack is broken then sorting out the
+	 *  symbol with lazy dl fixup breaks sparc64, so force
+	 *  fixup with an illegal munmap call
+	 */
+	(void)munmap(MAP_FAILED, 0);
+
+	stress_proc_state_set(args->name, STRESS_STATE_SYNC_WAIT);
+	stress_sync_start_wait(args);
+	stress_proc_state_set(args->name, STRESS_STATE_RUN);
+
+	do {
+		pid_t pid;
+
+		(void)stress_mwc32();
+		if (UNLIKELY(!stress_continue_flag()))
+			return EXIT_SUCCESS;
+		pid = stress_retry_fork(args, 0);
+		if (pid < 0) {
+			if (UNLIKELY(!stress_continue(args)))
+				return EXIT_SUCCESS;
+			pr_err("%s: fork failed, errno=%d: (%s)\n",
+				args->name, errno, strerror(errno));
+			return EXIT_NO_RESOURCE;
+		} else if (pid > 0) {
+			int status;
+			pid_t ret;
+
+			/* Parent, wait for child */
+			ret = waitpid(pid, &status, 0);
+			if (ret < 0) {
+				if (errno != EINTR)
+					pr_dbg("%s: waitpid() on PID %" PRIdMAX " failed, errno=%d (%s)\n",
+						args->name, (intmax_t)pid, errno, strerror(errno));
+				(void)stress_kill_pid_wait(pid, NULL);
+			} else if (WIFSIGNALED(status)) {
+				/* If we got killed by OOM killer, re-start */
+				if (WTERMSIG(status) == SIGKILL) {
+					if (g_opt_flags & OPT_FLAGS_OOMABLE) {
+						stress_system_memory_info_log();
+						pr_dbg("%s: assuming killed by OOM "
+							"killer, bailing out "
+							"(instance %" PRIu32 ")\n",
+							args->name, args->instance);
+						rc = EXIT_SUCCESS;
+						goto finish;
+					} else {
+						stress_system_memory_info_log();
+						pr_dbg("%s: assuming killed by OOM "
+							"killer, restarting again "
+							"(instance %" PRIu32 ")\n",
+							args->name, args->instance);
+						continue;
+					}
+				}
+				/* expected: child killed itself with SIGSEGV */
+				if (WTERMSIG(status) == SIGSEGV)
+					stress_bogo_inc(args);
+			} else if (WIFEXITED(status)) {
+				if (WEXITSTATUS(status) != EXIT_SUCCESS) {
+					rc = WEXITSTATUS(status);
+					goto finish;
+				}
+			}
+		} else {
+			stress_proc_state_set(args->name, STRESS_STATE_RUN);
+			stress_make_it_fail_set();
+			_exit(stress_bad_altstack_child(args));
+		}
+	} while (stress_continue(args));
+
+finish:
+	stress_proc_state_set(args->name, STRESS_STATE_DEINIT);
+
+#if defined(O_TMPFILE)
+	if (bus_stack != MAP_FAILED)
+		(void)munmap(bus_stack, stack_size);
+#else
+	UNEXPECTED
+#endif
+	if (zero_stack != MAP_FAILED)
+		(void)munmap(zero_stack, stack_size);
+	if (guarded_stack != MAP_FAILED)
+		(void)munmap((void *)guarded_stack, guarded_stack_size);
+
+	return rc;
+}
+
+static const stress_exercises_t exercises[] = {
+	STRESS_EX_FEATURE("d-cache-write-miss"),
+	STRESS_EX_FEATURE("page-faults-kernel"),
+	STRESS_EX_FEATURE("stack"),
+	STRESS_EX_FEATURE("vmalloc"),
+
+	STRESS_EX_SYSCALL("sigaltstack"),
+
+	STRESS_EX_END,
+};
+
+const stressor_info_t stress_bad_altstack_info = {
+	.stressor = stress_bad_altstack,
+	.classifier = CLASS_VM | CLASS_MEMORY | CLASS_OS,
+	.verify = VERIFY_ALWAYS,
+	.help = help,
+	.exercises = exercises,
+};
+#else
+const stressor_info_t stress_bad_altstack_info = {
+	.stressor = stress_unimplemented,
+	.classifier = CLASS_VM | CLASS_MEMORY | CLASS_OS,
+	.verify = VERIFY_ALWAYS,
+	.help = help,
+	.unimplemented_reason = "built without siglongjmp(), sigaltstack() or mprotect()"
+};
+#endif

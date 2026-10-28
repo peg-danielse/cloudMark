@@ -1,0 +1,279 @@
+/*
+ * Copyright (C) 2013-2021 Canonical, Ltd.
+ * Copyright (C) 2022-2026 Colin Ian King.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
+ *
+ */
+#include "stress-ng.h"
+#include "core-capabilities.h"
+#include "core-mmap.h"
+#include "core-out-of-memory.h"
+
+static const stress_help_t help[] = {
+	{ NULL,	"oom-pipe N",	  "start N workers exercising large pipes" },
+	{ NULL,	"oom-pipe-ops N", "stop after N oom-pipe bogo operations" },
+	{ NULL,	NULL,		  NULL }
+};
+
+#if defined(F_SETPIPE_SZ) &&	\
+    defined(O_NONBLOCK) &&	\
+    defined(F_SETFL)
+
+typedef int pipe_fds_t[2];
+
+typedef struct {
+	size_t max_fd;		/* Maximum allowed open file descriptors */
+	size_t max_pipes;	/* Maximum allowed pipes (max_fd / 2) */
+	size_t max_pipe_size;	/* Maximum pipe buffer size */
+	void *rd_buffer;	/* Read buffer */
+	void *wr_buffer;	/* Write buffer */
+	pipe_fds_t *fds;	/* Pipe file descriptors */
+} stress_oom_pipe_context_t;
+
+/*
+ *  pipe_empty()
+ *	read data from read end of pipe
+ */
+static void pipe_empty(
+	const int fd,
+	const size_t max,
+	const size_t page_size,
+	uint32_t *rd_buffer)
+{
+	size_t i;
+
+	for (i = 0; i < max; i += page_size) {
+		ssize_t ret;
+
+		ret = read(fd, (void *)rd_buffer, page_size);
+		if (ret < 0)
+			return;
+	}
+}
+
+/*
+ *  pipe_fill()
+ *	write data to fill write end of pipe
+ */
+static void pipe_fill(
+	const int fd,
+	const size_t max,
+	const size_t page_size,
+	uint32_t *wr_buffer)
+{
+	size_t i;
+	static uint32_t val = 0;
+
+	for (i = 0; i < max; i += page_size) {
+		ssize_t ret;
+
+		*wr_buffer = val++;
+		ret = write(fd, (void *)wr_buffer, page_size);
+		if (ret < (ssize_t)page_size)
+			return;
+	}
+}
+
+static int stress_oom_pipe_child(stress_args_t *args, void *ctxt)
+{
+	stress_oom_pipe_context_t *context = (stress_oom_pipe_context_t *)ctxt;
+	const size_t max_pipes = context->max_pipes;
+	const size_t page_size = args->page_size;
+
+	size_t i;
+	pipe_fds_t *fds = context->fds;
+	int pipes_open = 0;
+	const bool aggressive = (g_opt_flags & OPT_FLAGS_AGGRESSIVE);
+	uint32_t *rd_buffer = (uint32_t *)context->rd_buffer;
+	uint32_t *wr_buffer = (uint32_t *)context->wr_buffer;
+
+	stress_uint8rnd4((uint8_t *)wr_buffer, page_size);
+
+	/* Explicitly drop capabilities, makes it more OOM-able */
+	VOID_RET(int, stress_capabilities_drop(args->name));
+
+	for (i = 0; i < max_pipes; i++) {
+		fds[i][0] = -1;
+		fds[i][1] = -1;
+	}
+
+	for (i = 0; LIKELY(stress_continue(args) && (i < max_pipes)); i++) {
+		if ((g_opt_flags & OPT_FLAGS_OOM_AVOID) && stress_memory_low_check(page_size))
+			break;
+
+		if (pipe(fds[i]) == 0) {
+			if (fcntl(fds[i][0], F_SETFL, O_NONBLOCK) < 0) {
+				pr_fail("%s: fcntl F_SET_FL O_NONBLOCK failed, errno=%d (%s)\n",
+					args->name, errno, strerror(errno));
+				goto clean;
+			}
+			if (fcntl(fds[i][1], F_SETFL, O_NONBLOCK) < 0) {
+				pr_fail("%s: fcntl F_SET_FL O_NONBLOCK failed, errno=%d (%s)\n",
+					args->name, errno, strerror(errno));
+				goto clean;
+			}
+			pipes_open++;
+		} else {
+			break;
+		}
+	}
+
+	if (!pipes_open) {
+		pr_dbg("%s: opening pipes failed, aborted\n",
+			args->name);
+		goto clean;
+	}
+
+	do {
+		/* Set to maximum size */
+		for (i = 0; LIKELY(stress_continue(args) && (i < max_pipes)); i++) {
+			size_t max_size = context->max_pipe_size;
+
+			if ((fds[i][0] < 0) || (fds[i][1] < 0))
+				continue;
+			if ((g_opt_flags & OPT_FLAGS_OOM_AVOID) && stress_memory_low_check(max_size * 2))
+				break;
+			if (fcntl(fds[i][0], F_SETPIPE_SZ, max_size) < 0)
+				max_size = page_size;
+			if (fcntl(fds[i][1], F_SETPIPE_SZ, max_size) < 0)
+				max_size = page_size;
+			pipe_fill(fds[i][1], max_size, page_size, wr_buffer);
+			if (!aggressive)
+				pipe_empty(fds[i][0], max_size, page_size, rd_buffer);
+		}
+		/* Set to invalid size */
+		for (i = 0; LIKELY(stress_continue(args) && (i < max_pipes)); i++) {
+			if ((fds[i][0] < 0) || (fds[i][1] < 0))
+				continue;
+			(void)fcntl(fds[i][0], F_SETPIPE_SZ, -1);
+			(void)fcntl(fds[i][1], F_SETPIPE_SZ, -1);
+		}
+
+		/* Set to minimum size */
+		for (i = 0; LIKELY(stress_continue(args) && (i < max_pipes)); i++) {
+			if ((fds[i][0] < 0) || (fds[i][1] < 0))
+				continue;
+			(void)fcntl(fds[i][0], F_SETPIPE_SZ, page_size);
+			(void)fcntl(fds[i][1], F_SETPIPE_SZ, page_size);
+			pipe_fill(fds[i][1], page_size, page_size, wr_buffer);
+			if (!aggressive)
+				pipe_empty(fds[i][0], page_size, page_size, rd_buffer);
+		}
+		stress_bogo_inc(args);
+	} while (stress_continue(args));
+
+	/* And close the pipes */
+clean:
+	for (i = 0; i < max_pipes; i++) {
+		if (fds[i][0] != -1)
+			(void)close(fds[i][0]);
+		if (fds[i][1] != -1)
+			(void)close(fds[i][1]);
+	}
+	return EXIT_SUCCESS;
+}
+
+/*
+ *  stress_oom_pipe
+ *	stress pipe memory allocation
+ */
+static int stress_oom_pipe(stress_args_t *args)
+{
+	const size_t page_size = args->page_size;
+	const size_t buffer_size = page_size << 1;
+	int rc;
+	stress_oom_pipe_context_t context;
+	void *buffer;
+
+	buffer = stress_mmap_populate(NULL, buffer_size, PROT_READ | PROT_WRITE,
+			MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+	if (buffer == MAP_FAILED) {
+		pr_inf_skip("%s: mmap %zu byte pipe write buffer failed%s, "
+			"errno=%d (%s), skipping stressor\n",
+			args->name, buffer_size, stress_memory_free_get(),
+			errno, strerror(errno));
+		return EXIT_NO_RESOURCE;
+	}
+	stress_memory_anon_name_set(buffer, buffer_size, "rw-pipe-buffer");
+	context.wr_buffer = (uint32_t *)buffer;
+	context.rd_buffer = (uint32_t *)((uintptr_t)buffer + page_size);
+
+	context.max_fd = stress_fs_file_limit_get();
+	context.max_pipes = context.max_fd / 2;
+	context.max_pipe_size = stress_fs_max_pipe_size_get();
+
+	context.fds = (pipe_fds_t *)calloc(context.max_pipes, sizeof(*context.fds));
+	if (!context.fds) {
+		/* Shrink down */
+		context.max_fd = 1024 * 1024;
+		context.max_pipes = context.max_fd / 2;
+		context.fds = (pipe_fds_t *)calloc(context.max_pipes, sizeof(*context.fds));
+		if (!context.fds) {
+			pr_inf_skip("%s: allocate %zu file descriptors failed%s, skipping stressor\n",
+				args->name, context.max_fd,
+				stress_memory_free_get());
+			(void)munmap(buffer, buffer_size);
+			return EXIT_NO_RESOURCE;
+		}
+	}
+
+	if (context.max_pipe_size < page_size)
+		context.max_pipe_size = page_size;
+	context.max_pipe_size &= ~(page_size - 1);
+
+	stress_proc_state_set(args->name, STRESS_STATE_SYNC_WAIT);
+	stress_sync_start_wait(args);
+	stress_proc_state_set(args->name, STRESS_STATE_RUN);
+
+	rc = stress_oomable_child(args, &context, stress_oom_pipe_child, STRESS_OOMABLE_DROP_CAP);
+
+	stress_proc_state_set(args->name, STRESS_STATE_DEINIT);
+
+	free(context.fds);
+	(void)munmap(buffer, buffer_size);
+
+	return rc;
+}
+
+static const stress_exercises_t exercises[] = {
+	STRESS_EX_FEATURE("chaotic-load"),
+	STRESS_EX_FEATURE("oom"),
+	STRESS_EX_FEATURE("system-time"),
+
+	STRESS_EX_SYSCALL("fcntl"),
+	STRESS_EX_SYSCALL("pipe"),
+	STRESS_EX_SYSCALL("read"),
+	STRESS_EX_SYSCALL("write"),
+
+	STRESS_EX_END,
+};
+
+const stressor_info_t stress_oom_pipe_info = {
+	.stressor = stress_oom_pipe,
+	.classifier = CLASS_MEMORY | CLASS_OS | CLASS_PATHOLOGICAL,
+	.verify = VERIFY_ALWAYS,
+	.help = help,
+	.exercises = exercises,
+};
+#else
+const stressor_info_t stress_oom_pipe_info = {
+	.stressor = stress_unimplemented,
+	.classifier = CLASS_MEMORY | CLASS_OS | CLASS_PATHOLOGICAL,
+	.verify = VERIFY_ALWAYS,
+	.help = help,
+	.unimplemented_reason = "built without F_SETFL, F_SETPIPE_SZ or O_NONBLOCK fcntl() commands"
+};
+#endif

@@ -1,0 +1,329 @@
+/*
+ * Copyright (C) 2013-2021 Canonical, Ltd.
+ * Copyright (C) 2022-2026 Colin Ian King.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
+ *
+ */
+#include "stress-ng.h"
+#include "core-mmap.h"
+#include "core-put.h"
+#include "core-signal.h"
+
+static const stress_help_t help[] = {
+	{ NULL,	"fault N",	"start N workers producing page faults" },
+	{ NULL,	"fault-ops N",	"stop after N page fault bogo operations" },
+	{ NULL,	NULL,		NULL }
+};
+
+#if defined(HAVE_SIGLONGJMP)
+
+static sigjmp_buf jmp_env;
+static volatile bool do_jmp = true;
+static volatile int die_signum = -1;
+
+/*
+ *  stress_segvhandler()
+ *	SEGV handler
+ */
+static void MLOCKED_TEXT stress_segvhandler(int signum)
+{
+	die_signum = signum;
+
+	stress_signal_siglongjmp_flag(signum, jmp_env, 1, &do_jmp);
+}
+
+/*
+ *  stress_fault()
+ *	stress min and max page faulting
+ */
+static int stress_fault(stress_args_t *args)
+{
+#if defined(HAVE_GETRUSAGE) &&		\
+    defined(RUSAGE_SELF) &&		\
+    defined(HAVE_RUSAGE_RU_MINFLT)
+	struct rusage usage;
+#endif
+	char filename[PATH_MAX];
+	int ret;
+	CLOBBERED int i;
+	char *start;
+	char *end;
+	const size_t len = stress_exec_text_addr(&start, &end);
+	const size_t page_size = args->page_size;
+#if defined(SHIM_POSIX_FADV_DONTNEED) &&	\
+    defined(HAVE_POSIX_FADVISE)
+	const size_t file_size = page_size * 64;
+#endif
+	uint8_t buffer[page_size];
+	void *mapto;
+#if defined(HAVE_GETRUSAGE) &&		\
+    defined(RUSAGE_SELF) &&		\
+    defined(HAVE_RUSAGE_RU_MINFLT)
+	double t1 = 0.0;
+	double t2 = 0.0;
+	double dt;
+#endif
+	CLOBBERED double duration = 0.0;
+	CLOBBERED double count = 0.0;
+	CLOBBERED int rc = EXIT_SUCCESS;
+
+	stress_uint8rnd4(buffer, page_size);
+
+	ret = stress_fs_temp_dir_make_args(args);
+	if (ret < 0)
+		return stress_exit_status(-ret);
+
+	(void)stress_fs_temp_filename_args(args,
+		filename, sizeof(filename), stress_mwc32());
+
+	if (stress_signal_handler(args->name, SIGSEGV, stress_segvhandler, NULL) < 0)
+		return EXIT_FAILURE;
+	if (stress_signal_handler(args->name, SIGBUS, stress_segvhandler, NULL) < 0)
+		return EXIT_FAILURE;
+
+	mapto = mmap(NULL, page_size, PROT_READ,
+		MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+	if (mapto != MAP_FAILED)
+		stress_memory_anon_name_set(mapto, page_size, "mapping-ro-page");
+
+	stress_proc_state_set(args->name, STRESS_STATE_SYNC_WAIT);
+	stress_sync_start_wait(args);
+	stress_proc_state_set(args->name, STRESS_STATE_RUN);
+
+#if defined(HAVE_GETRUSAGE) &&		\
+    defined(RUSAGE_SELF) &&		\
+    defined(HAVE_RUSAGE_RU_MINFLT)
+	t1 = stress_time_now();
+#endif
+	i = 0;
+	do {
+		int fd = -1;
+		uint8_t *ptr;
+		volatile uint8_t *vptr;
+		double t;
+
+		ret = sigsetjmp(jmp_env, 1);
+		if (ret) {
+			do_jmp = false;
+			pr_fail("%s: unexpected %s, terminating early\n",
+				args->name, stress_signal_str(die_signum));
+			rc = EXIT_FAILURE;
+			break;
+		}
+
+		fd = open(filename, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+		if (fd < 0) {
+			if ((errno == ENOSPC) || (errno == ENOMEM))
+				continue;	/* Try again */
+			pr_fail("%s: open '%s' failed, errno=%d (%s)\n",
+				args->name, filename, errno, strerror(errno));
+			rc = EXIT_FAILURE;
+			break;
+		}
+
+redo:
+		if (stress_continue_flag() && (write(fd, buffer, sizeof(buffer)) < 0)) {
+			if ((errno == EAGAIN) || (errno == EINTR))
+				goto redo;
+			if (errno == ENOSPC) {
+				(void)close(fd);
+				continue;
+			}
+			(void)close(fd);
+			pr_fail("%s: write failed, errno=%d (%s)\n",
+				args->name, errno, strerror(errno));
+			rc = EXIT_FAILURE;
+			break;
+		}
+#if defined(SHIM_POSIX_FADV_DONTNEED) &&	\
+    defined(HAVE_POSIX_FADVISE)
+		/* Force major page faults */
+		(void)shim_fdatasync(fd);
+		(void)posix_fadvise(fd, 0, file_size, SHIM_POSIX_FADV_DONTNEED);
+#endif
+		ret = sigsetjmp(jmp_env, 1);
+		if (ret) {
+			if (UNLIKELY(!stress_continue(args)))
+				do_jmp = false;
+			if (fd != -1)
+				(void)close(fd);
+			goto next;
+		}
+
+		/*
+		 * Removing file here causes major fault when we touch
+		 * ptr later
+		 */
+		if (i & 1)
+			(void)shim_unlink(filename);
+		ptr = (uint8_t *)mmap(NULL, page_size, PROT_READ | PROT_WRITE,
+			MAP_SHARED, fd, 0);
+		if (ptr == MAP_FAILED) {
+			if ((errno == EAGAIN) ||
+			    (errno == ENOMEM) ||
+			    (errno == ENFILE)) {
+				(void)close(fd);
+				goto next;
+			}
+			pr_err("%s: mmap of a page failed%s, errno=%d (%s)\n",
+				args->name, stress_memory_free_get(),
+				errno, strerror(errno));
+			(void)close(fd);
+			break;
+
+		}
+		vptr = (volatile uint8_t *)ptr;
+		stress_put_uint8(*vptr);
+
+		(void)close(fd);
+		t = stress_time_now();
+		*vptr = 0xff;		/* Cause the page fault */
+		duration += stress_time_now() - t;
+		count += 1.0;
+
+		stress_memory_anon_name_set(ptr, page_size, "page-fault-major");
+
+#if defined(HAVE_MADVISE) &&	\
+    defined(MADV_DONTNEED)
+		if (madvise((void *)ptr, page_size, MADV_DONTNEED) == 0) {
+			t = stress_time_now();
+			*vptr ^= 0xff;	/* Cause the page fault */
+			duration += stress_time_now() - t;
+			count += 1.0;
+		}
+#endif
+
+#if defined(HAVE_MADVISE) &&	\
+    defined(MADV_PAGEOUT)
+		if (madvise((void *)ptr, page_size, MADV_PAGEOUT) == 0) {
+			t = stress_time_now();
+			*vptr ^= 0xff;	/* Cause the page fault */
+			duration += stress_time_now() - t;
+			count += 1.0;
+		}
+#endif
+		stress_put_uint8(*vptr);
+
+		if (stress_munmap_force((void *)ptr, page_size) < 0) {
+			pr_err("%s: munmap failed, errno=%d (%s)\n",
+				args->name, errno, strerror(errno));
+			break;
+		}
+
+next:
+		/* Remove file on-non major fault case */
+		if (!(i & 1))
+			(void)shim_unlink(filename);
+
+		/*
+		 *  Force a minor page fault by remapping an existing
+		 *  page in the text segment onto page mapto and then
+		 *  force reading a byte from the start of the page.
+		 */
+		if (len > (page_size << 1)) {
+			if (mapto != MAP_FAILED) {
+				ptr = (uint8_t *)mmap(mapto, page_size, PROT_READ,
+					MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+				if (ptr != MAP_FAILED) {
+					stress_put_uint8(*ptr);
+					stress_memory_anon_name_set(ptr, page_size, "page-fault-minor");
+#if defined(HAVE_MADVISE) &&	\
+    defined(MADV_DONTNEED)
+					if (madvise((void *)ptr, page_size, MADV_DONTNEED) == 0) {
+						t = stress_time_now();
+						stress_put_uint8(*ptr);
+						duration += stress_time_now() - t;
+						count += 1.0;
+					}
+#endif
+					(void)stress_munmap_force((void *)ptr, page_size);
+				}
+			}
+		}
+		i++;
+		stress_bogo_inc(args);
+	} while (stress_continue(args));
+
+	(void)stress_signal_default_handler(SIGBUS);
+	(void)stress_signal_default_handler(SIGSEGV);
+
+#if defined(HAVE_GETRUSAGE) &&		\
+    defined(RUSAGE_SELF) &&		\
+    defined(HAVE_RUSAGE_RU_MINFLT)
+	t2 = stress_time_now();
+#endif
+	/* Clean up, most times this is redundant */
+
+	stress_proc_state_set(args->name, STRESS_STATE_DEINIT);
+
+	if (mapto != MAP_FAILED)
+		(void)munmap(mapto, page_size);
+	(void)shim_unlink(filename);
+	(void)stress_fs_temp_dir_rm_args(args);
+
+#if defined(HAVE_GETRUSAGE) &&		\
+    defined(RUSAGE_SELF) &&		\
+    defined(HAVE_RUSAGE_RU_MINFLT)
+	if (!shim_getrusage(RUSAGE_SELF, &usage)) {
+		pr_dbg("%s: page faults: minor: %ld, major: %ld\n",
+			args->name, usage.ru_minflt, usage.ru_majflt);
+	}
+	dt = t2 - t1;
+	if (dt > 0.0) {
+		double average_duration;
+
+		stress_metrics_set(args, "minor page faults per sec",
+			(double)usage.ru_minflt / dt, STRESS_METRIC_HARMONIC_MEAN);
+		stress_metrics_set(args, "major page faults per sec",
+			(double)usage.ru_majflt / dt, STRESS_METRIC_HARMONIC_MEAN);
+		average_duration = (count > 0.0) ? duration / count : 0.0;
+		stress_metrics_set(args, "nanosecs per page fault",
+			average_duration * STRESS_DBL_NANOSECOND, STRESS_METRIC_HARMONIC_MEAN);
+	}
+#endif
+	return rc;
+}
+
+static const stress_exercises_t exercises[] = {
+	STRESS_EX_FEATURE("io-read"),
+	STRESS_EX_FEATURE("io-write"),
+
+	STRESS_EX_SYSCALL("mmap"),
+	STRESS_EX_SYSCALL("munmap"),
+#if defined(HAVE_MADVISE) &&	\
+    (defined(MADV_DONTNEED) || defined(MADV_PAGEOUT))
+	STRESS_EX_SYSCALL("madvise"),
+#endif
+	STRESS_EX_END,
+};
+
+const stressor_info_t stress_fault_info = {
+	.stressor = stress_fault,
+	.classifier = CLASS_INTERRUPT | CLASS_OS,
+	.help = help,
+	.exercises = exercises,
+};
+
+#else
+
+const stressor_info_t stress_fault_info = {
+	.stressor = stress_unimplemented,
+	.classifier = CLASS_INTERRUPT | CLASS_OS,
+	.help = help,
+	.unimplemented_reason = "built without siglongjmp() support"
+};
+
+#endif

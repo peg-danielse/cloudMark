@@ -1,0 +1,224 @@
+/*
+ * Copyright (C) 2013-2021 Canonical, Ltd.
+ * Copyright (C) 2022-2026 Colin Ian King.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
+ *
+ */
+#include "stress-ng.h"
+#include "core-builtin.h"
+#include "core-killpid.h"
+#include "core-mmap.h"
+
+static const stress_help_t help[] = {
+	{ NULL,	"sigrt N",	"start N workers sending real time signals" },
+	{ NULL,	"sigrt-ops N",	"stop after N real time signal bogo operations" },
+	{ NULL,	NULL,		NULL }
+};
+
+#if defined(HAVE_SIGQUEUE) &&		\
+    defined(HAVE_SIGWAITINFO) &&	\
+    defined(SIGRTMIN) &&		\
+    defined(SIGRTMAX)
+
+#define MAX_RTSIGS	(SIGRTMAX - SIGRTMIN + 1)
+
+/*
+ *  stress_sigrt
+ *	stress by heavy real time sigqueue message sending
+ */
+static int stress_sigrt(stress_args_t *args)
+{
+	stress_pid_t *s_pids;
+	union sigval s ALIGN64;
+	int i;
+	int rc = EXIT_SUCCESS;
+	stress_metrics_t *stress_sigrt_metrics;
+	size_t stress_sigrt_metrics_size = sizeof(*stress_sigrt_metrics) * MAX_RTSIGS;
+	double count;
+	double duration;
+	double rate;
+
+	stress_sigrt_metrics = (stress_metrics_t *)
+		stress_mmap_populate(NULL, stress_sigrt_metrics_size,
+			PROT_READ | PROT_WRITE,
+			MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+	if (stress_sigrt_metrics == MAP_FAILED) {
+		pr_inf_skip("%s: mmap %zu bytes failed%s, errno=%d (%s), "
+			"skipping stressor\n",
+			args->name, stress_sigrt_metrics_size,
+			stress_memory_free_get(), errno, strerror(errno));
+		return EXIT_NO_RESOURCE;
+	}
+	stress_memory_anon_name_set(stress_sigrt_metrics, stress_sigrt_metrics_size, "metrics");
+	s_pids = (stress_pid_t *)calloc((size_t)MAX_RTSIGS, sizeof(*s_pids));
+	if (!s_pids) {
+		pr_inf_skip("%s: allocate array of %zu pids failed%s, skipping stressor\n",
+			args->name, (size_t)MAX_RTSIGS, stress_memory_free_get());
+		(void)munmap((void *)stress_sigrt_metrics, stress_sigrt_metrics_size);
+		return EXIT_NO_RESOURCE;
+	}
+	stress_sync_init_pids(s_pids, MAX_RTSIGS);
+
+	stress_zero_metrics(stress_sigrt_metrics, MAX_RTSIGS);
+	for (i = 0; i < MAX_RTSIGS; i++) {
+		if (stress_signal_handler(args->name, i + SIGRTMIN, stress_signal_ignore_handler, NULL) < 0) {
+			free(s_pids);
+			(void)munmap((void *)stress_sigrt_metrics, stress_sigrt_metrics_size);
+			return EXIT_FAILURE;
+		}
+	}
+
+	stress_proc_state_set(args->name, STRESS_STATE_SYNC_WAIT);
+	stress_sync_start_wait(args);
+	stress_proc_state_set(args->name, STRESS_STATE_RUN);
+
+	for (i = 0; i < MAX_RTSIGS; i++) {
+		s_pids[i].pid = stress_retry_fork(args, 0);
+		if (s_pids[i].pid < 0) {
+			if (UNLIKELY(!stress_continue(args)))
+				goto reap;
+			pr_err("%s: fork failed, errno=%d (%s)\n",
+				args->name, errno, strerror(errno));
+			goto reap;
+		} else if (s_pids[i].pid == 0) {
+			sigset_t mask;
+			siginfo_t info ALIGN64;
+			int idx, j;
+
+			stress_proc_state_set(args->name, STRESS_STATE_RUN);
+			stress_make_it_fail_set();
+			stress_parent_died_alarm();
+			(void)stress_sched_settings_apply(true);
+
+			(void)sigemptyset(&mask);
+			for (j = 0; j < MAX_RTSIGS; j++)
+				(void)sigaddset(&mask, j + SIGRTMIN);
+
+			(void)shim_memset(&info, 0, sizeof info);
+
+			while (stress_continue_flag()) {
+				if (UNLIKELY(sigwaitinfo(&mask, &info) < 0)) {
+					if (errno == EINTR)
+						continue;
+					break;
+				}
+
+				idx = info.si_signo - SIGRTMIN;
+				if ((idx >= 0) && (idx < MAX_RTSIGS)) {
+					const double delta = stress_time_now() - stress_sigrt_metrics[idx].t_start;
+					if (delta > 0.0) {
+						stress_sigrt_metrics[idx].duration += delta;
+						stress_sigrt_metrics[idx].count += 1.0;
+					}
+				}
+				if (UNLIKELY(info.si_value.sival_int == 0))
+					break;
+
+				if (info.si_value.sival_int != -1) {
+					(void)shim_memset(&s, 0, sizeof(s));
+					s.sival_int = -1;
+					(void)sigqueue(info.si_value.sival_int, SIGRTMIN, s);
+				}
+			}
+			_exit(0);
+		}
+	}
+
+	/* Parent */
+	do {
+		(void)shim_memset(&s, 0, sizeof(s));
+
+		for (i = 0; i < MAX_RTSIGS; i++) {
+			const int pid = s_pids[i].pid;
+
+			/* Inform child which pid to queue a signal to */
+			s.sival_int = pid;
+			stress_sigrt_metrics[i].t_start = stress_time_now();
+
+			if (UNLIKELY(sigqueue(pid, i + SIGRTMIN, s) < 0)) {
+				if ((errno != EAGAIN) && (errno != EINTR)) {
+					pr_fail("%s: sigqueue on signal %d failed, "
+						"errno=%d (%s)\n",
+						args->name, i + SIGRTMIN,
+						errno, strerror(errno));
+					rc = EXIT_FAILURE;
+					break;
+				}
+			}
+			stress_bogo_inc(args);
+		}
+	} while (stress_continue(args));
+
+	stress_proc_state_set(args->name, STRESS_STATE_DEINIT);
+
+	(void)shim_memset(&s, 0, sizeof(s));
+	for (i = 0; i < MAX_RTSIGS; i++) {
+		if (s_pids[i].pid > 0) {
+			s.sival_int = 0;
+			(void)sigqueue(s_pids[i].pid, i + SIGRTMIN, s);
+		}
+	}
+	(void)shim_usleep(250);
+reap:
+	stress_proc_state_set(args->name, STRESS_STATE_DEINIT);
+	(void)stress_kill_and_wait_many(args, s_pids, MAX_RTSIGS, SIGALRM, false);
+
+	duration = 0.0;
+	count = 0.0;
+	for (i = 0; i < MAX_RTSIGS; i++) {
+		duration += stress_sigrt_metrics[i].duration;
+		count += stress_sigrt_metrics[i].count;
+	}
+	rate = (count > 0.0) ? duration / count : 0.0;
+	stress_metrics_set(args, "nanosecs between sigqueue and sigwaitinfo completion",
+		rate * STRESS_DBL_NANOSECOND, STRESS_METRIC_HARMONIC_MEAN);
+
+	free(s_pids);
+	(void)munmap((void *)stress_sigrt_metrics, stress_sigrt_metrics_size);
+
+	return rc;
+}
+
+static const stress_exercises_t exercises[] = {
+	STRESS_EX_FEATURE("context-switches"),
+	STRESS_EX_FEATURE("load-average"),
+	STRESS_EX_FEATURE("stack"),
+
+#if defined(__linux__)
+	STRESS_EX_SYSCALL("sigreturn"),
+#endif
+	STRESS_EX_SYSCALL("sigqueue"),
+	STRESS_EX_SYSCALL("sigwaitinfo"),
+
+	STRESS_EX_END,
+};
+
+const stressor_info_t stress_sigrt_info = {
+	.stressor = stress_sigrt,
+	.classifier = CLASS_SIGNAL | CLASS_OS,
+	.verify = VERIFY_ALWAYS,
+	.help = help,
+	.exercises = exercises,
+};
+#else
+const stressor_info_t stress_sigrt_info = {
+	.stressor = stress_unimplemented,
+	.classifier = CLASS_SIGNAL | CLASS_OS,
+	.verify = VERIFY_ALWAYS,
+	.help = help,
+	.unimplemented_reason = "built without sigqueue() or sigwaitinfo() or defined SIGRTMIN or SIGRTMAX"
+};
+#endif

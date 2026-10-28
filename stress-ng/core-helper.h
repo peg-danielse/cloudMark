@@ -1,0 +1,108 @@
+/*
+ * Copyright (C) 2024-2026 Colin Ian King.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
+ *
+ */
+#ifndef CORE_HELPER_H
+#define CORE_HELPER_H
+
+#include "stress-ng.h"
+
+/*
+ *  stress_warn_once hashes the current filename and line where
+ *  the macro is used and returns true if it's never been called
+ *  there before across all threads and child processes
+ */
+#define stress_warn_once()	stress_warn_once_hash(__FILE__, __LINE__)
+
+/*
+ *  stringification macros
+ */
+#define STRESS_XSTRINGIFY(s)	STRESS_STRINGIFY(s)
+#define STRESS_STRINGIFY(s)	#s
+
+typedef struct stress_load_average_info {
+	double min1;
+	double min5;
+	double min15;
+} stress_load_average_info_t;
+
+extern const char ALIGN64 stress_ascii64[64];
+extern const char ALIGN64 stress_ascii32[32];
+
+extern WARN_UNUSED int32_t stress_cpus_online_get(void);
+extern WARN_UNUSED int32_t stress_cpus_configured_get(void);
+extern WARN_UNUSED int32_t stress_ticks_per_second_get(void);
+extern WARN_UNUSED int stress_load_average_get(stress_load_average_info_t *load_average_info);
+extern void stress_parent_died_alarm(void);
+extern int stress_process_dumpable(const bool dumpable);
+extern void stress_timer_slack_set(const bool check_zero);
+extern void stress_proc_name_init(int argc, char *argv[], char *envp[]);
+extern void stress_proc_name_raw_set(const char *name);
+extern void stress_proc_name_set(const char *name);
+extern void stress_proc_name_scramble(void);
+extern void stress_proc_name_state_str_set(const char *name, const char *str);
+extern void stress_proc_state_set(const char *name, const int state);
+extern size_t stress_munge_underscore(char *dst, const char *src, size_t len);
+extern WARN_UNUSED int stress_strcmp_munged(const char *s1, const char *s2);
+extern WARN_UNUSED uint64_t stress_uint64_zero_get(void);
+extern WARN_UNUSED void *stress_null_get(void);
+extern CONST WARN_UNUSED bool stress_little_endian(void);
+extern void stress_buildinfo(void);
+extern void stress_yaml_buildinfo(FILE *yaml);
+extern void stress_runinfo(void);
+extern void stress_yaml_runinfo(FILE *yaml);
+extern WARN_UNUSED unsigned int stress_cpu_get(void);
+extern WARN_UNUSED const char *stress_compiler_get(void) RETURNS_NONNULL;
+extern WARN_UNUSED const char *stress_uname_info_get(void) RETURNS_NONNULL;
+extern CONST WARN_UNUSED int stress_unimplemented(stress_args_t *args);
+extern char *stress_uint64_to_str(char *str, const size_t len, const uint64_t val,
+	const int precision, const bool no_zero);
+extern WARN_UNUSED char *stress_const_optdup(const char *opt);
+extern size_t stress_exec_text_addr(char **start, char **end);
+extern WARN_UNUSED bool stress_is_dev_tty(const int fd);
+extern WARN_UNUSED bool stress_warn_once_hash(const char *filename, const int line);
+extern WARN_UNUSED int stress_unused_uid_get(uid_t *uid);
+extern CONST WARN_UNUSED int stress_kernel_release(const int major, const int minor,
+	const int patchlevel);
+extern WARN_UNUSED int stress_kernel_release_get(void);
+extern WARN_UNUSED pid_t stress_unused_racy_pid_get(const bool fork_test);
+extern WARN_UNUSED size_t stress_hostname_length_get(void);
+extern WARN_UNUSED int stress_tty_width_get(void);
+extern WARN_UNUSED pid_t stress_retry_fork(stress_args_t *args, const int retries);
+extern void stress_clear_warn_once(void);
+extern WARN_UNUSED size_t stress_flag_permutation(const int flags, int **permutations);
+extern CONST WARN_UNUSED int stress_exit_status(const int err);
+extern WARN_UNUSED char *stress_proc_self_exe_get(char *path, const size_t path_len);
+extern WARN_UNUSED int stress_bsd_getsysctl(const char *name, void *ptr, size_t size);
+extern WARN_UNUSED uint64_t stress_bsd_getsysctl_uint64(const char *name);
+extern WARN_UNUSED uint32_t stress_bsd_getsysctl_uint32(const char *name);
+extern WARN_UNUSED unsigned int stress_bsd_getsysctl_uint(const char *name);
+extern WARN_UNUSED int stress_bsd_getsysctl_int(const char *name);
+extern WARN_UNUSED int stress_x86_readmsr64(const int cpu, const uint32_t reg,
+	uint64_t *val);
+extern void stress_random_small_sleep(void);
+extern void stress_yield_sleep_ms(void);
+extern void stress_process_info(stress_args_t *args, const pid_t pid);
+extern uint64_t stress_machine_id_get(void);
+extern void stress_zero_metrics(stress_metrics_t *metrics, const size_t n);
+extern bool OPTIMIZE3 stress_data_is_not_zero(uint64_t *buffer, const size_t len);
+extern void NORETURN stress_no_return(void);
+extern WARN_UNUSED char *stress_env_ld_library_path_get(void);
+extern void stress_make_it_fail_set(void);
+extern size_t stress_log2(const size_t n);
+
+#endif
