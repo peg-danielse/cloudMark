@@ -1,0 +1,11 @@
+# Wrapper built by the Mercury cmake build, the port names it is launched as,
+# and the memcached server those wrappers exec.
+/memcached-server
+/11211
+/11212
+/11213
+/11214
+/11311
+/11312
+/11313
+/local/
