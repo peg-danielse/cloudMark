@@ -1,0 +1,6 @@
+# github.com/apache/thrift v0.19.0
+## explicit; go 1.20
+github.com/apache/thrift/lib/go/thrift
+# golang.org/x/sys v0.13.0
+## explicit; go 1.17
+golang.org/x/sys/unix

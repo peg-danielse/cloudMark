@@ -1,0 +1,10 @@
+#!/bin/sh
+# Mercury keeps its own working directory. The services open
+# config/jaeger-config.yml and config/service-config.json relative to their
+# working directory: this tree, or SOCIAL_RUNDIR when set (goperate -jaeger
+# writes a per-run config/ there with the requested trace sampling).
+# The tree is found from this script's path (Mercury execs it by absolute path).
+root=$(CDPATH= cd "$(dirname "$0")/.." && pwd)
+name=$(basename "$0")
+cd "${SOCIAL_RUNDIR:-$root}" || exit 1
+exec "$root/bin/$name" "$@"

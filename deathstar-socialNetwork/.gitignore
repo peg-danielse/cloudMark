@@ -1,0 +1,8 @@
+bin/
+build/
+operate/obj/
+operate/operate
+datasets/
+rings/
+goperate/bin/
+*.o

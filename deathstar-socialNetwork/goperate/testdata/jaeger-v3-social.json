@@ -1,0 +1,355 @@
+{
+ "result": {
+  "resourceSpans": [
+   {
+    "resource": {
+     "attributes": [
+      {
+       "key": "service.name",
+       "value": {
+        "stringValue": "compose-post-service"
+       }
+      }
+     ]
+    },
+    "scopeSpans": [
+     {
+      "scope": {},
+      "spans": [
+       {
+        "traceId": "00000000000000000000000000000051",
+        "spanId": "0000000000000001",
+        "name": "compose_post_server",
+        "kind": 1,
+        "startTimeUnixNano": "1792395000000000000",
+        "endTimeUnixNano": "1792395000020000000",
+        "status": {}
+       },
+       {
+        "traceId": "00000000000000000000000000000051",
+        "spanId": "0000000000000002",
+        "parentSpanId": "0000000000000001",
+        "name": "compose_text_client",
+        "kind": 1,
+        "startTimeUnixNano": "1792395000001000000",
+        "endTimeUnixNano": "1792395000006000000",
+        "status": {}
+       },
+       {
+        "traceId": "00000000000000000000000000000051",
+        "spanId": "0000000000000007",
+        "parentSpanId": "0000000000000001",
+        "name": "store_post_client",
+        "kind": 1,
+        "startTimeUnixNano": "1792395000007000000",
+        "endTimeUnixNano": "1792395000012000000",
+        "status": {}
+       },
+       {
+        "traceId": "00000000000000000000000000000051",
+        "spanId": "000000000000000a",
+        "parentSpanId": "0000000000000001",
+        "name": "write_home_timeline_client",
+        "kind": 1,
+        "startTimeUnixNano": "1792395000013000000",
+        "endTimeUnixNano": "1792395000015000000",
+        "status": {}
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "resource": {
+     "attributes": [
+      {
+       "key": "service.name",
+       "value": {
+        "stringValue": "text-service"
+       }
+      }
+     ]
+    },
+    "scopeSpans": [
+     {
+      "scope": {},
+      "spans": [
+       {
+        "traceId": "00000000000000000000000000000051",
+        "spanId": "0000000000000003",
+        "parentSpanId": "0000000000000002",
+        "name": "compose_text_server",
+        "kind": 1,
+        "startTimeUnixNano": "1792395000001500000",
+        "endTimeUnixNano": "1792395000005500000",
+        "status": {}
+       },
+       {
+        "traceId": "00000000000000000000000000000051",
+        "spanId": "0000000000000004",
+        "parentSpanId": "0000000000000003",
+        "name": "compose_urls_client",
+        "kind": 1,
+        "startTimeUnixNano": "1792395000002000000",
+        "endTimeUnixNano": "1792395000004000000",
+        "status": {}
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "resource": {
+     "attributes": [
+      {
+       "key": "service.name",
+       "value": {
+        "stringValue": "url-shorten-service"
+       }
+      }
+     ]
+    },
+    "scopeSpans": [
+     {
+      "scope": {},
+      "spans": [
+       {
+        "traceId": "00000000000000000000000000000051",
+        "spanId": "0000000000000005",
+        "parentSpanId": "0000000000000004",
+        "name": "compose_urls_server",
+        "kind": 1,
+        "startTimeUnixNano": "1792395000002200000",
+        "endTimeUnixNano": "1792395000003800000",
+        "status": {}
+       },
+       {
+        "traceId": "00000000000000000000000000000051",
+        "spanId": "0000000000000006",
+        "parentSpanId": "0000000000000005",
+        "name": "url_mongo_insert_client",
+        "kind": 1,
+        "startTimeUnixNano": "1792395000002500000",
+        "endTimeUnixNano": "1792395000003500000",
+        "status": {}
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "resource": {
+     "attributes": [
+      {
+       "key": "service.name",
+       "value": {
+        "stringValue": "post-storage-service"
+       }
+      }
+     ]
+    },
+    "scopeSpans": [
+     {
+      "scope": {},
+      "spans": [
+       {
+        "traceId": "00000000000000000000000000000051",
+        "spanId": "0000000000000008",
+        "parentSpanId": "0000000000000007",
+        "name": "store_post_server",
+        "kind": 1,
+        "startTimeUnixNano": "1792395000007500000",
+        "endTimeUnixNano": "1792395000011500000",
+        "status": {}
+       },
+       {
+        "traceId": "00000000000000000000000000000051",
+        "spanId": "0000000000000009",
+        "parentSpanId": "0000000000000008",
+        "name": "post_storage_mongo_insert_client",
+        "kind": 1,
+        "startTimeUnixNano": "1792395000008000000",
+        "endTimeUnixNano": "1792395000011000000",
+        "status": {}
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "resource": {
+     "attributes": [
+      {
+       "key": "service.name",
+       "value": {
+        "stringValue": "write-home-timeline-service"
+       }
+      }
+     ]
+    },
+    "scopeSpans": [
+     {
+      "scope": {},
+      "spans": [
+       {
+        "traceId": "00000000000000000000000000000051",
+        "spanId": "000000000000000b",
+        "parentSpanId": "000000000000000a",
+        "name": "write_home_timeline_server",
+        "kind": 1,
+        "startTimeUnixNano": "1792395000016000000",
+        "endTimeUnixNano": "1792395000030000000",
+        "status": {}
+       },
+       {
+        "traceId": "00000000000000000000000000000051",
+        "spanId": "000000000000000c",
+        "parentSpanId": "000000000000000b",
+        "name": "write_home_timeline_redis_update_client",
+        "kind": 1,
+        "startTimeUnixNano": "1792395000017000000",
+        "endTimeUnixNano": "1792395000020000000",
+        "status": {}
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "resource": {
+     "attributes": [
+      {
+       "key": "service.name",
+       "value": {
+        "stringValue": "home-timeline-service"
+       }
+      }
+     ]
+    },
+    "scopeSpans": [
+     {
+      "scope": {},
+      "spans": [
+       {
+        "traceId": "00000000000000000000000000000052",
+        "spanId": "0000000000000001",
+        "name": "read_home_timeline_server",
+        "kind": 1,
+        "startTimeUnixNano": "1792395000050000000",
+        "endTimeUnixNano": "1792395000054000000",
+        "status": {}
+       },
+       {
+        "traceId": "00000000000000000000000000000052",
+        "spanId": "0000000000000002",
+        "parentSpanId": "0000000000000001",
+        "name": "read_home_timeline_redis_find_client",
+        "kind": 1,
+        "startTimeUnixNano": "1792395000050500000",
+        "endTimeUnixNano": "1792395000051500000",
+        "status": {}
+       },
+       {
+        "traceId": "00000000000000000000000000000052",
+        "spanId": "0000000000000003",
+        "parentSpanId": "0000000000000001",
+        "name": "read_posts_client",
+        "kind": 1,
+        "startTimeUnixNano": "1792395000051500000",
+        "endTimeUnixNano": "1792395000053500000",
+        "status": {}
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "resource": {
+     "attributes": [
+      {
+       "key": "service.name",
+       "value": {
+        "stringValue": "post-storage-service"
+       }
+      }
+     ]
+    },
+    "scopeSpans": [
+     {
+      "scope": {},
+      "spans": [
+       {
+        "traceId": "00000000000000000000000000000052",
+        "spanId": "0000000000000004",
+        "parentSpanId": "0000000000000003",
+        "name": "post_storage_read_posts_server",
+        "kind": 1,
+        "startTimeUnixNano": "1792395000051700000",
+        "endTimeUnixNano": "1792395000053300000",
+        "status": {}
+       },
+       {
+        "traceId": "00000000000000000000000000000052",
+        "spanId": "0000000000000005",
+        "parentSpanId": "0000000000000004",
+        "name": "post_storage_mmc_mget_client",
+        "kind": 1,
+        "startTimeUnixNano": "1792395000052000000",
+        "endTimeUnixNano": "1792395000053000000",
+        "status": {}
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "resource": {
+     "attributes": [
+      {
+       "key": "service.name",
+       "value": {
+        "stringValue": "user-service"
+       }
+      }
+     ]
+    },
+    "scopeSpans": [
+     {
+      "scope": {},
+      "spans": [
+       {
+        "traceId": "00000000000000000000000000000053",
+        "spanId": "0000000000000001",
+        "name": "login_server",
+        "kind": 1,
+        "startTimeUnixNano": "1792395000060000000",
+        "endTimeUnixNano": "1792395000063000000",
+        "status": {}
+       },
+       {
+        "traceId": "00000000000000000000000000000053",
+        "spanId": "0000000000000002",
+        "parentSpanId": "0000000000000001",
+        "name": "user_mmc_get_client",
+        "kind": 1,
+        "startTimeUnixNano": "1792395000060500000",
+        "endTimeUnixNano": "1792395000061000000",
+        "status": {}
+       },
+       {
+        "traceId": "00000000000000000000000000000053",
+        "spanId": "0000000000000003",
+        "parentSpanId": "0000000000000001",
+        "name": "user_mongo_find_client",
+        "kind": 1,
+        "startTimeUnixNano": "1792395000061000000",
+        "endTimeUnixNano": "1792395000062500000",
+        "status": {}
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ }
+}
