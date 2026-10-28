@@ -4,3 +4,4 @@ bin/mongos
 # Wrapper built by the Mercury cmake build, and the data directory it creates.
 /mongod
 /27017/
+/27018/
