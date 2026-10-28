@@ -1,2 +1,4 @@
 # Wrapper built by the Mercury cmake build.
 /rabbitmq-server
+# The RabbitMQ node data directory (mnesia, logs), created by the wrapper at run time.
+/5672/

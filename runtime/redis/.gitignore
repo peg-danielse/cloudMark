@@ -1,2 +1,4 @@
 # Wrapper built by the Mercury cmake build.
 /redis-server
+# The redis data directory (dump.rdb), created by the wrapper at run time.
+/6379/
