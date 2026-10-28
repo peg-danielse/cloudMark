@@ -1,0 +1,72 @@
+# Jaeger v2 all-in-one for Mercury/DeathStarBench trace collection (memory storage).
+# Every listen port comes from an environment variable (run-jaeger.sh sets them from a base offset).
+# Receivers: legacy jaeger.thrift (UDP compact 6831 / binary 6832, HTTP 14268, gRPC 14250) for
+# jaeger-client-go (hotel) and jaeger-client-cpp (social), plus OTLP gRPC/HTTP.
+# Query: HTTP API (/api/traces, /api/v3/traces) and gRPC. No zipkin, no remote sampling, no self-metrics.
+service:
+  extensions: [jaeger_storage, jaeger_query, healthcheckv2]
+  pipelines:
+    traces:
+      receivers: [jaeger, otlp]
+      processors: [batch]
+      exporters: [jaeger_storage_exporter]
+  telemetry:
+    resource:
+      attributes:
+        - name: service.name
+          value: jaeger
+    metrics:
+      level: none
+    traces:
+      level: none
+    logs:
+      level: ${env:JAEGER_LOG_LEVEL:-warn}
+
+extensions:
+  jaeger_query:
+    storage:
+      traces: store
+    http:
+      endpoint: "${env:JAEGER_HOST:-127.0.0.1}:${env:JAEGER_QUERY_HTTP_PORT:-16686}"
+    grpc:
+      endpoint: "${env:JAEGER_HOST:-127.0.0.1}:${env:JAEGER_QUERY_GRPC_PORT:-16685}"
+  jaeger_storage:
+    backends:
+      store:
+        memory:
+          max_traces: ${env:JAEGER_MAX_TRACES:-200000}
+  healthcheckv2:
+    use_v2: true
+    http:
+      endpoint: "${env:JAEGER_HOST:-127.0.0.1}:${env:JAEGER_HEALTH_PORT:-13133}"
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: "${env:JAEGER_HOST:-127.0.0.1}:${env:JAEGER_OTLP_GRPC_PORT:-4317}"
+      http:
+        endpoint: "${env:JAEGER_HOST:-127.0.0.1}:${env:JAEGER_OTLP_HTTP_PORT:-4318}"
+  jaeger:
+    protocols:
+      grpc:
+        endpoint: "${env:JAEGER_HOST:-127.0.0.1}:${env:JAEGER_GRPC_PORT:-14250}"
+      thrift_http:
+        endpoint: "${env:JAEGER_HOST:-127.0.0.1}:${env:JAEGER_THRIFT_HTTP_PORT:-14268}"
+      thrift_binary:
+        endpoint: "${env:JAEGER_HOST:-127.0.0.1}:${env:JAEGER_THRIFT_BINARY_PORT:-6832}"
+      thrift_compact:
+        endpoint: "${env:JAEGER_HOST:-127.0.0.1}:${env:JAEGER_THRIFT_COMPACT_PORT:-6831}"
+        queue_size: 5000
+        max_packet_size: 65000
+        workers: 4
+        socket_buffer_size: 8388608
+
+processors:
+  batch:
+    send_batch_size: 2048
+    timeout: 200ms
+
+exporters:
+  jaeger_storage_exporter:
+    trace_storage: store

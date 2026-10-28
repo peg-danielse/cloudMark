@@ -1,0 +1,2503 @@
+diff --git a/goperate/autoscale.go b/goperate/autoscale.go
+index 4c44815..5b69759 100644
+--- a/goperate/autoscale.go
++++ b/goperate/autoscale.go
+@@ -3,7 +3,6 @@ package main
+ import (
+ 	"fmt"
+ 	"io"
+-	"os"
+ 	"path/filepath"
+ 	"runtime"
+ 	"strconv"
+@@ -125,6 +124,11 @@ func autoscaleServices(base string, cfg serviceConfig, lines []tuple, maxUsers i
+ 	fmt.Printf("policy %s placement %s tick_ms %d min %d max %d users 1-%d routes %s mix %s graph %s\n",
+ 		servicePolicy, servicePlacement, serviceTickMs, svcMinCores, svcMaxCores, maxUsers, opts.routes, orDefault(opts.mix, "equal"), opts.graph)
+ 
++	out, finishTraces, err := beginTraceAnalysis()
++	if err != nil {
++		return err
++	}
++	defer finishTraces()
+ 	if opts.mode == clientInproc {
+ 		w, err := loadGraph(opts.graph)
+ 		if err != nil {
+@@ -133,10 +137,11 @@ func autoscaleServices(base string, cfg serviceConfig, lines []tuple, maxUsers i
+ 		if w.mix, err = parseMix(opts.mix, names); err != nil {
+ 			return err
+ 		}
++		traceMarks = tracing.enabled()
+ 		gen := &genMeter{cpus: inprocCPUs, busy: selfBusy, max: len(clientCPUs())}
+-		return driveRoutes(cfg, names, maxUsers, w, os.Stdout, lines, gen)
++		return driveRoutes(cfg, names, maxUsers, w, out, lines, gen)
+ 	}
+-	return runMercuryLoadgen(base, maxUsers, opts, track)
++	return runMercuryLoadgen(base, maxUsers, opts, track, out)
+ }
+ 
+ func orDefault(s, d string) string {
+@@ -156,15 +161,19 @@ func driveRoutes(cfg serviceConfig, names []string, maxUsers int, wl *workload,
+ 	if err != nil {
+ 		return err
+ 	}
+-	for _, clients := range rampClients(maxUsers) {
++	var marks markCounter
++	for level, clients := range rampClients(maxUsers) {
+ 		for _, route := range routes {
+ 			route.rec.setActive(int32(routeUsers(clients, route.weight)))
+ 		}
+ 		for window := 0; window < autoWindows; window++ {
+ 			g0 := gen.begin()
++			t0 := time.Now()
+ 			readings := measureRoutes(routes)
++			t1 := time.Now()
+ 			gw := gen.end(g0)
+ 			cpus := cpuSetList(lines, readCPUSet)
++			marks.emit(w, level, window, clients, t0, t1) // -jaeger only: window marker for the trace analyser
+ 			for i, route := range routes {
+ 				reading := readings[i]
+ 				fmt.Fprintf(w, "route %s clients %d arrival_rate %d service_rate %d avg_us %.1f p95_us %.1f p99_us %.1f errors %d cpus %s %s\n",
+diff --git a/goperate/jaeger_app.go b/goperate/jaeger_app.go
+new file mode 100644
+index 0000000..79327cc
+--- /dev/null
++++ b/goperate/jaeger_app.go
+@@ -0,0 +1,163 @@
++package main
++
++// Social-network side of the Jaeger integration (shared machinery in
++// jaegercp.go).
++//
++// Sampling: the C++ services call SetUpTracer("config/jaeger-config.yml"),
++// relative to their working directory, and jaeger-client-cpp does not read
++// env. The repo's config/jaeger-config.yml has sampler const 0, so tracing
++// is off by default. With -jaeger, goperate writes a per-run directory
++// (<traces dir>/social-cwd/config/) holding a generated jaeger-config.yml
++// (sampler probabilistic -trace-sample; reporter endpoint
++// http://-jaeger-host:14268+offset/api/traces, or localAgentHostPort
++// :6831+offset with -trace-transport udp) and a symlink to the real
++// service-config.json, and passes SOCIAL_RUNDIR=<dir> to the run/ wrappers,
++// which cd there instead of the repo root. The repo's config is never edited
++// and the services are not rebuilt; without -jaeger nothing changes.
++
++import (
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"time"
++)
++
++const envSocialRunDir = "SOCIAL_RUNDIR"
++
++// socialMemcached: which memcached (program basename = port) each service's
++// mmc/memcached spans talk to (service-config.json *-memcached).
++var socialMemcached = map[string]string{
++	"user-service":         "11311",
++	"user-mention-service": "11311",
++	"post-storage-service": "11312",
++	"url-shorten-service":  "11313",
++}
++
++// socialServiceDaemon maps a tracer service name to its run/ binary:
++// compose-post-service -> ComposePostService (inverse of serviceKey).
++func socialServiceDaemon(svc string) string {
++	var b strings.Builder
++	for _, part := range strings.Split(svc, "-") {
++		if part != "" {
++			b.WriteString(strings.ToUpper(part[:1]) + part[1:])
++		}
++	}
++	return b.String()
++}
++
++// socialTraceModel: the route is the one whose entry service owns the root
++// span (the loadgen's Thrift calls carry an empty carrier, so the entry
++// service starts the trace); store calls are charged by span name.
++func socialTraceModel() traceModel {
++	rootRoute := map[string]string{}
++	for route, svc := range routeService {
++		rootRoute[svc] = route
++	}
++	return traceModel{
++		route:   func(root *traceSpan) string { return rootRoute[root.service] },
++		service: socialServiceDaemon,
++		backend: func(s *traceSpan) string {
++			n := strings.ToLower(s.name)
++			switch {
++			case s.service == "compose-post-service" && n == "write_home_timeline_client":
++				return "rabbitmq-server" // publish; the consumer runs after the request returns
++			case strings.Contains(n, "rabbitmq") || strings.Contains(n, "amqp"):
++				return "rabbitmq-server"
++			case strings.Contains(n, "redis"):
++				return "redis-server"
++			case strings.Contains(n, "mongo"):
++				return "mongod"
++			case strings.Contains(n, "mmc") || strings.Contains(n, "memcached"):
++				if d, ok := socialMemcached[s.service]; ok {
++					return d
++				}
++				return "memcached"
++			}
++			return ""
++		},
++	}
++}
++
++// socialJaegerYAML is the jaeger-client-cpp config for this run.
++func socialJaegerYAML(o *jaegerOpts) string {
++	reporter := "  endpoint: " + o.collectorHTTP()
++	if o.transport == "udp" {
++		reporter = "  localAgentHostPort: " + o.agentUDP()
++	}
++	return fmt.Sprintf(`# generated by goperate -jaeger (%s); see goperate/jaeger_app.go
++disabled: false
++reporter:
++  logSpans: false
++  queueSize: 10000
++  bufferFlushInterval: 1
++%s
++sampler:
++  type: probabilistic
++  param: %s
++`, time.Now().Format(time.RFC3339), reporter, o.sampleString())
++}
++
++func socialRunDir() string { return filepath.Join(filepath.Dir(tracing.out), "social-cwd") }
++
++// prepareSocialRunDir writes <dir>/config/jaeger-config.yml and links
++// <dir>/config/service-config.json to serviceConfig.
++func prepareSocialRunDir(dir, serviceConfig string) error {
++	cfgDir := filepath.Join(dir, "config")
++	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
++		return err
++	}
++	if err := os.WriteFile(filepath.Join(cfgDir, "jaeger-config.yml"), []byte(socialJaegerYAML(tracing)), 0o644); err != nil {
++		return err
++	}
++	abs, err := filepath.Abs(serviceConfig)
++	if err != nil {
++		return err
++	}
++	link := filepath.Join(cfgDir, "service-config.json")
++	_ = os.Remove(link)
++	return os.Symlink(abs, link)
++}
++
++// addTraceEnv points the C++ service wrappers at the per-run config directory.
++func addTraceEnv(line tuple, env map[string]string) map[string]string {
++	if !tracing.enabled() || !strings.HasSuffix(filepath.Base(line.path), "Service") {
++		return env
++	}
++	if env == nil {
++		env = map[string]string{}
++	}
++	env[envSocialRunDir] = socialRunDir()
++	return env
++}
++
++func socialOutputDir() string { return filepath.Join(snRoot, "output") }
++
++func defaultGenOut() string {
++	return filepath.Join(socialOutputDir(), fmt.Sprintf("loadgen-%d.out", time.Now().Unix()))
++}
++
++func jaegerLogPath() string {
++	return strings.TrimSuffix(tracing.out, filepath.Ext(tracing.out)) + ".jaeger.log"
++}
++
++// beginTraceAnalysis returns the writer autoscale prints route lines to and a
++// finish function (see hotel operate/jaeger_app.go).
++func beginTraceAnalysis() (io.Writer, func(), error) {
++	if !tracing.enabled() {
++		return os.Stdout, func() {}, nil
++	}
++	out := lockedWriter{mu: &sync.Mutex{}, w: os.Stdout}
++	var cpOut io.Writer
++	if tracing.cpLines {
++		cpOut = out
++	}
++	t, err := newCPTracer(tracing.queryBase(), socialTraceModel(), tracing.out, cpOut, tracing.lag, tracing.depth)
++	if err != nil {
++		return nil, nil, err
++	}
++	fmt.Printf("traces csv %s query %s sample %s lag %s depth %d\n", tracing.out, tracing.queryBase(), tracing.sampleString(), tracing.lag, tracing.depth)
++	return &lineSniffer{w: out, on: t.onLine}, func() { fmt.Println(t.close()) }, nil
++}
+diff --git a/goperate/jaeger_app_test.go b/goperate/jaeger_app_test.go
+new file mode 100644
+index 0000000..78e9982
+--- /dev/null
++++ b/goperate/jaeger_app_test.go
+@@ -0,0 +1,106 @@
++package main
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++func TestSocialServiceDaemon(t *testing.T) {
++	for _, bin := range []string{"ComposePostService", "UserMentionService", "UniqueIdService", "UrlShortenService", "WriteHomeTimelineService"} {
++		if got := socialServiceDaemon(serviceKey(bin)); got != bin {
++			t.Errorf("%s -> %s -> %s", bin, serviceKey(bin), got)
++		}
++	}
++}
++
++// testdata/jaeger-v3-social.json: compose-post (nested RPCs, Mongo, an async
++// RabbitMQ consumer that outlives the request), read-home-timeline (Redis,
++// RPC to post-storage, memcached) and login (memcached, Mongo).
++func TestSocialCriticalPath(t *testing.T) {
++	traces := loadFixture(t, "jaeger-v3-social.json")
++	m := socialTraceModel()
++	want := map[string]map[string]float64{
++		"compose-post": {"ComposePostService": 8, "TextService": 3, "UrlShortenService": 1, "PostStorageService": 2,
++			"mongod": 4, "rabbitmq-server": 2},
++		"read-home-timeline": {"HomeTimelineService": 1, "PostStorageService": 1, "11312": 1, "redis-server": 1},
++		"login":              {"UserService": 1, "11311": 0.5, "mongod": 1.5},
++	}
++	seen := map[string]bool{}
++	for _, spans := range traces {
++		r, ok := analyzeTrace(spans, m)
++		if !ok {
++			t.Fatalf("trace %s not analysed", spans[0].traceID)
++		}
++		seen[r.route] = true
++		w := want[r.route]
++		var sum int64
++		for d, v := range r.crit {
++			sum += v
++			if !near(ms(v), w[d]) {
++				t.Errorf("%s %s: %.3f ms, want %.3f", r.route, d, ms(v), w[d])
++			}
++		}
++		for d, v := range w {
++			if !near(ms(r.crit[d]), v) {
++				t.Errorf("%s %s missing: %.3f ms, want %.3f", r.route, d, ms(r.crit[d]), v)
++			}
++		}
++		if sum != r.dur {
++			t.Errorf("%s: path %d != request %d", r.route, sum, r.dur)
++		}
++		if r.route == "compose-post" {
++			if r.spans["WriteHomeTimelineService"] != 1 || r.crit["WriteHomeTimelineService"] != 0 || r.spans["redis-server"] != 1 {
++				t.Errorf("async consumer: spans %v crit %v", r.spans, r.crit)
++			}
++			if !near(ms(r.rpc["TextService"]), 1) || !near(ms(r.rpc["UrlShortenService"]), 0.4) || !near(ms(r.rpc["PostStorageService"]), 1) {
++				t.Errorf("rpc %v", r.rpc)
++			}
++		}
++	}
++	if len(seen) != 3 {
++		t.Fatalf("routes %v", seen)
++	}
++}
++
++func TestSocialRunDir(t *testing.T) {
++	defer func(old *jaegerOpts) { tracing = old }(tracing)
++	dir := t.TempDir()
++	tracing = &jaegerOpts{on: true, host: "127.0.0.1", offset: 10, sample: 0.03, transport: "http", out: filepath.Join(dir, "run", "traces.csv")}
++	svcCfg := filepath.Join(dir, "service-config.json")
++	os.WriteFile(svcCfg, []byte("{}"), 0o644)
++	if err := prepareSocialRunDir(socialRunDir(), svcCfg); err != nil {
++		t.Fatal(err)
++	}
++	if err := prepareSocialRunDir(socialRunDir(), svcCfg); err != nil { // idempotent
++		t.Fatal(err)
++	}
++	y, err := os.ReadFile(filepath.Join(dir, "run", "social-cwd", "config", "jaeger-config.yml"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, s := range []string{"disabled: false", "type: probabilistic", "param: 0.03", "endpoint: http://127.0.0.1:14278/api/traces", "bufferFlushInterval: 1"} {
++		if !strings.Contains(string(y), s) {
++			t.Errorf("config lacks %q:\n%s", s, y)
++		}
++	}
++	if target, _ := os.Readlink(filepath.Join(dir, "run", "social-cwd", "config", "service-config.json")); target != svcCfg {
++		t.Errorf("link -> %s", target)
++	}
++	tracing.transport = "udp"
++	if !strings.Contains(socialJaegerYAML(tracing), "localAgentHostPort: 127.0.0.1:6841") {
++		t.Error("udp reporter")
++	}
++	env := addTraceEnv(tuple{path: "/b/deathstar-socialNetwork/run/TextService"}, nil)
++	if env[envSocialRunDir] != filepath.Join(dir, "run", "social-cwd") {
++		t.Errorf("env %v", env)
++	}
++	if env := addTraceEnv(tuple{path: "/b/runtime/memcached/11311"}, map[string]string{"MEMCACHED_THREADS": "16"}); len(env) != 1 {
++		t.Errorf("memcached env %v", env)
++	}
++	tracing = nil
++	if env := addTraceEnv(tuple{path: "/b/run/TextService"}, nil); env != nil {
++		t.Errorf("tracing off: %v", env)
++	}
++}
+diff --git a/goperate/jaegercp.go b/goperate/jaegercp.go
+new file mode 100644
+index 0000000..557679d
+--- /dev/null
++++ b/goperate/jaegercp.go
+@@ -0,0 +1,971 @@
++package main
++
++// jaegercp.go: Jaeger tracing for the Mercury operators. This file is shared
++// verbatim by deathstar-hotelReservations/operate and
++// deathstar-socialNetwork/goperate (stdlib only, no app types except tuple,
++// start, setCpus and kill, which both operators define with the same
++// signatures). The app-specific parts (sampling hook, span -> daemon model)
++// live in jaeger_app.go in each repo.
++//
++// What it does when -jaeger is on:
++//
++//  1. startJaeger runs the Jaeger v2 all-in-one (run-jaeger.sh from
++//     ~/Benchmarks/jaeger) as a bare helper process pinned with taskset
++//     (-jaeger-mode bare), as a Mercury daemon moved onto -jaeger-cpus with
++//     POST /cpus (-jaeger-mode mercury), or uses one that is already running
++//     (-jaeger-mode external).
++//  2. driveRoutes prints one marker line per measurement window
++//     ("window <n> level <l> wi <i> clients <c> start_us <a> end_us <b>").
++//     Route parsers only match "^route", so the marker is invisible to them.
++//  3. lineSniffer sees those markers on the operator's stdout copy and hands
++//     each window to cpTracer, which waits -trace-lag-ms (client flush plus
++//     collector batch), fetches the window's traces from the Jaeger v3 query
++//     API, and computes a CRISP-style critical path for every sampled request.
++//  4. Each window writes traces.csv rows (route x daemon) and, with
++//     -trace-cp-lines, one "cp ..." summary line per route to stdout.
++//
++// Critical path (CRISP, Zhang et al., USENIX ATC'22): walk back from the end
++// of a span; the child that finished last before the cursor is on the path,
++// the gap after it is the parent's own time, then continue from that child's
++// start. Children are clipped to the parent's interval (async work that
++// outlives the request, e.g. RabbitMQ consumers, is off the path). A client
++// span's own time (serialisation, network, queueing in front of the callee)
++// is charged to the callee (and counted in rpc_share); a client span that
++// waits on a store (memcached, MongoDB, Redis) is charged to that store's
++// daemon. All time of the root interval is attributed, so per request the
++// shares of all daemons sum to 1.
++
++import (
++	"bytes"
++	"encoding/csv"
++	"encoding/json"
++	"flag"
++	"fmt"
++	"io"
++	"math"
++	"net"
++	"net/http"
++	"net/url"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"syscall"
++	"time"
++)
++
++// ---------------------------------------------------------------- options
++
++const (
++	jaegerModeBare     = "bare"
++	jaegerModeMercury  = "mercury"
++	jaegerModeExternal = "external"
++
++	// Default Jaeger ports; -jaeger-port-offset is added to every one.
++	jaegerPortCompact   = 6831  // jaeger.thrift compact, UDP (agent protocol)
++	jaegerPortBinary    = 6832  // jaeger.thrift binary, UDP
++	jaegerPortThriftHTT = 14268 // jaeger.thrift over HTTP (/api/traces)
++	jaegerPortQueryHTTP = 16686 // query API (/api/v3/...)
++	jaegerPortHealth    = 13133
++)
++
++// jaegerOpts are the -jaeger* and -trace-* flags.
++type jaegerOpts struct {
++	on        bool
++	mode      string
++	script    string
++	cpus      string
++	host      string
++	offset    int
++	addr      string // query API host:port; "" = host:16686+offset
++	sample    float64
++	transport string // http | udp (apps that support it)
++	storage   string
++	maxTraces int
++	lag       time.Duration
++	depth     int
++	out       string
++	cpLines   bool
++	avoid     string // ports Jaeger must not take, e.g. "8080,18180-18199"
++}
++
++// tracing is set by main from the flags (nil or !on = tracing off, old behaviour).
++var tracing *jaegerOpts
++
++// addJaegerFlags registers the tracing flags on the default flag set.
++func addJaegerFlags(benchRoot string) *jaegerOpts {
++	o := &jaegerOpts{}
++	flag.BoolVar(&o.on, "jaeger", false, "trace: start Jaeger, enable app tracing at -trace-sample, write per-window critical-path shares (traces.csv)")
++	flag.StringVar(&o.mode, "jaeger-mode", jaegerModeBare, "how Jaeger runs: bare (helper process, taskset -jaeger-cpus, no sudo), mercury (Mercury daemon moved to -jaeger-cpus), external (already running)")
++	flag.StringVar(&o.script, "jaeger-bin", benchRoot+"/jaeger/run-jaeger.sh", "Jaeger launcher (run-jaeger.sh, env-configured)")
++	flag.StringVar(&o.cpus, "jaeger-cpus", "62", "helper CPU list for Jaeger (keep it off the service pool)")
++	flag.StringVar(&o.host, "jaeger-host", "127.0.0.1", "address Jaeger listens on and the apps report to")
++	flag.IntVar(&o.offset, "jaeger-port-offset", 0, "added to every Jaeger port (6831/6832 udp, 14268, 14250, 4317, 4318, 16686, 16685, 13133)")
++	flag.StringVar(&o.addr, "jaeger-addr", "", "Jaeger query API host:port (default -jaeger-host:16686+offset)")
++	flag.Float64Var(&o.sample, "trace-sample", 0.02, "probabilistic sampling rate the apps are started with (0-1)")
++	flag.StringVar(&o.transport, "trace-transport", "http", "app -> Jaeger transport: http (jaeger.thrift to :14268) or udp (compact to :6831; C++ social only, Go hotel always uses http)")
++	flag.StringVar(&o.storage, "jaeger-storage", "memory", "Jaeger storage: memory or badger")
++	flag.IntVar(&o.maxTraces, "jaeger-max-traces", 200000, "memory storage bound (traces)")
++	flag.DurationVar(&o.lag, "trace-lag", 3*time.Second, "wait after a window ends before querying it (client flush 1 s + collector batch)")
++	flag.IntVar(&o.depth, "trace-depth", 5000, "max traces fetched per window (query.searchDepth)")
++	flag.StringVar(&o.out, "trace-out", "", "traces CSV (default traces.csv next to -gen-out, else output/traces-<unix>.csv)")
++	flag.BoolVar(&o.cpLines, "trace-cp-lines", true, "also print one 'cp window ... route ...' line per route and window")
++	flag.StringVar(&o.avoid, "jaeger-avoid-ports", "8080,18180-18199", "ports/ranges no Jaeger port may land on (other users' services)")
++	return o
++}
++
++func (o *jaegerOpts) validate() error {
++	if o == nil || !o.on {
++		return nil
++	}
++	switch o.mode {
++	case jaegerModeBare, jaegerModeMercury, jaegerModeExternal:
++	default:
++		return fmt.Errorf("-jaeger-mode must be bare, mercury or external")
++	}
++	if o.sample < 0 || o.sample > 1 {
++		return fmt.Errorf("-trace-sample must be in [0,1]")
++	}
++	if o.transport != "http" && o.transport != "udp" {
++		return fmt.Errorf("-trace-transport must be http or udp")
++	}
++	if o.storage != "memory" && o.storage != "badger" {
++		return fmt.Errorf("-jaeger-storage must be memory or badger")
++	}
++	if o.offset < 0 || jaegerPortQueryHTTP+o.offset > 65535 {
++		return fmt.Errorf("bad -jaeger-port-offset %d", o.offset)
++	}
++	if err := o.checkAvoid(); err != nil {
++		return err
++	}
++	if o.depth < 1 || (o.storage == "memory" && o.depth >= o.maxTraces) {
++		return fmt.Errorf("need 1 <= -trace-depth < -jaeger-max-traces")
++	}
++	if o.mode != jaegerModeExternal && strings.TrimSpace(o.cpus) == "" {
++		return fmt.Errorf("-jaeger-cpus is required for -jaeger-mode %s", o.mode)
++	}
++	return nil
++}
++
++func (o *jaegerOpts) enabled() bool { return o != nil && o.on }
++
++var jaegerAllPorts = []int{jaegerPortCompact, jaegerPortBinary, jaegerPortThriftHTT, 14250, 4317, 4318, jaegerPortQueryHTTP, 16685, jaegerPortHealth}
++
++// checkAvoid rejects an offset that puts any Jaeger port on -jaeger-avoid-ports.
++func (o *jaegerOpts) checkAvoid() error {
++	for _, part := range strings.Split(o.avoid, ",") {
++		part = strings.TrimSpace(part)
++		if part == "" {
++			continue
++		}
++		lo, hi, isRange := strings.Cut(part, "-")
++		a, err := strconv.Atoi(lo)
++		b := a
++		if err == nil && isRange {
++			b, err = strconv.Atoi(hi)
++		}
++		if err != nil || b < a {
++			return fmt.Errorf("bad -jaeger-avoid-ports entry %q", part)
++		}
++		for _, p := range jaegerAllPorts {
++			if q := o.port(p); q >= a && q <= b {
++				return fmt.Errorf("-jaeger-port-offset %d puts Jaeger port %d (default %d) in avoided %s", o.offset, q, p, part)
++			}
++		}
++	}
++	return nil
++}
++
++func (o *jaegerOpts) port(def int) int { return def + o.offset }
++
++func (o *jaegerOpts) hostPort(def int) string {
++	return net.JoinHostPort(o.host, strconv.Itoa(o.port(def)))
++}
++
++// queryBase is the Jaeger query API base URL.
++func (o *jaegerOpts) queryBase() string {
++	if o.addr != "" {
++		if strings.Contains(o.addr, "://") {
++			return strings.TrimRight(o.addr, "/")
++		}
++		return "http://" + o.addr
++	}
++	return "http://" + o.hostPort(jaegerPortQueryHTTP)
++}
++
++// collectorHTTP is the jaeger.thrift HTTP endpoint the clients post to.
++func (o *jaegerOpts) collectorHTTP() string {
++	return "http://" + o.hostPort(jaegerPortThriftHTT) + "/api/traces"
++}
++
++// agentUDP is the jaeger.thrift compact UDP address.
++func (o *jaegerOpts) agentUDP() string { return o.hostPort(jaegerPortCompact) }
++
++func (o *jaegerOpts) sampleString() string { return strconv.FormatFloat(o.sample, 'g', -1, 64) }
++
++// launchEnv configures run-jaeger.sh (Mercury passes only explicit env).
++func (o *jaegerOpts) launchEnv() map[string]string {
++	return map[string]string{
++		"JAEGER_PORT_OFFSET": strconv.Itoa(o.offset),
++		"JAEGER_STORAGE":     o.storage,
++		"JAEGER_MAX_TRACES":  strconv.Itoa(o.maxTraces),
++		"JAEGER_HOST":        o.host,
++	}
++}
++
++// csvPath is -trace-out, else traces.csv beside the loadgen output, else a
++// timestamped file in appOutputDir.
++func (o *jaegerOpts) csvPath(genOut, appOutputDir string) string {
++	if o.out != "" {
++		return o.out
++	}
++	if genOut != "" {
++		return filepath.Join(filepath.Dir(genOut), "traces.csv")
++	}
++	return filepath.Join(appOutputDir, fmt.Sprintf("traces-%d.csv", time.Now().Unix()))
++}
++
++// ---------------------------------------------------------------- Jaeger process
++
++type jaegerProc struct {
++	o    *jaegerOpts
++	cmd  *exec.Cmd
++	dead chan struct{} // closed when a bare Jaeger exits
++	base string        // Mercury base URL (mercury mode)
++	id   string        // Mercury daemon id (mercury mode)
++}
++
++// startJaeger brings Jaeger up according to o.mode and waits for its query API.
++// cpu is the Mercury daemon CPU (-cpu) used for /start in mercury mode; idPrefix
++// is "hotel" or "social"; logPath is the bare-mode log; track registers the
++// Mercury daemon for the operator's normal kill-on-exit.
++func startJaeger(o *jaegerOpts, base string, cpu int, idPrefix, logPath string, track func(tuple)) (*jaegerProc, error) {
++	p := &jaegerProc{o: o}
++	if o.mode == jaegerModeExternal {
++		if err := waitJaeger(o.queryBase(), 10*time.Second, nil); err != nil {
++			return nil, fmt.Errorf("-jaeger-mode external: %w", err)
++		}
++		fmt.Printf("jaeger external query %s collector %s\n", o.queryBase(), o.collectorHTTP())
++		return p, nil
++	}
++	if err := waitJaeger(o.queryBase(), 0, nil); err == nil {
++		return nil, fmt.Errorf("a Jaeger already answers on %s: use -jaeger-mode external or another -jaeger-port-offset", o.queryBase())
++	}
++	if err := jaegerPortsFree(o); err != nil {
++		return nil, err
++	}
++	if st, err := os.Stat(o.script); err != nil || st.Mode()&0o111 == 0 {
++		return nil, fmt.Errorf("jaeger launcher %s is missing or not executable", o.script)
++	}
++	env := o.launchEnv()
++	if logPath != "" {
++		if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
++			return nil, err
++		}
++		env["JAEGER_LOG"] = logPath
++	}
++	switch o.mode {
++	case jaegerModeBare:
++		env["JAEGER_CPUS"] = o.cpus
++		cmd := exec.Command(o.script)
++		cmd.Env = os.Environ()
++		for k, v := range env {
++			cmd.Env = append(cmd.Env, k+"="+v)
++		}
++		// Own process group (stop() signals the group); Pdeathsig so a killed
++		// operator does not leave Jaeger behind.
++		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGTERM}
++		if err := cmd.Start(); err != nil {
++			return nil, err
++		}
++		p.cmd, p.dead = cmd, make(chan struct{})
++		go func() { cmd.Wait(); close(p.dead) }()
++		fmt.Printf("jaeger bare pid %d cpus %s %s log %s\n", cmd.Process.Pid, o.cpus, formatEnv(env), logPath)
++	case jaegerModeMercury:
++		p.base, p.id = base, idPrefix+"-jaeger"
++		line := tuple{path: o.script, hostname: "localhost", id: p.id}
++		pid, err := start(base, line, cpu, env)
++		if err != nil {
++			return nil, fmt.Errorf("%s: %w", p.id, err)
++		}
++		track(line)
++		fmt.Printf("jaeger mercury daemon_id=%s pid %d %s\n", p.id, pid, formatEnv(env))
++		if err := setCpus(base, p.id, o.cpus); err != nil {
++			return p, err
++		}
++		fmt.Printf("jaeger cpus %s (fixed, no /scale policy)\n", o.cpus)
++	}
++	if err := waitJaeger(o.queryBase(), 60*time.Second, p.dead); err != nil {
++		p.stop()
++		if logPath != "" {
++			err = fmt.Errorf("%w (log %s)", err, logPath)
++		}
++		return nil, err
++	}
++	fmt.Printf("jaeger up query %s collector %s agent udp %s sample %s\n", o.queryBase(), o.collectorHTTP(), o.agentUDP(), o.sampleString())
++	return p, nil
++}
++
++// stop ends a bare Jaeger. Mercury mode is killed with the other tracked
++// daemons; external is left alone.
++func (p *jaegerProc) stop() {
++	if p == nil || p.cmd == nil || p.cmd.Process == nil {
++		return
++	}
++	pgid := p.cmd.Process.Pid
++	_ = syscall.Kill(-pgid, syscall.SIGTERM)
++	deadline := time.Now().Add(15 * time.Second)
++	for time.Now().Before(deadline) {
++		if syscall.Kill(-pgid, 0) != nil {
++			fmt.Printf("jaeger stopped\n")
++			p.cmd = nil
++			return
++		}
++		time.Sleep(100 * time.Millisecond)
++	}
++	_ = syscall.Kill(-pgid, syscall.SIGKILL)
++	fmt.Printf("jaeger killed\n")
++	p.cmd = nil
++}
++
++// waitJaeger polls GET /api/v3/services until it answers 200. timeout 0 = one
++// try; a closed dead channel (the process exited) ends the wait early.
++func waitJaeger(queryBase string, timeout time.Duration, dead <-chan struct{}) error {
++	deadline := time.Now().Add(timeout)
++	c := &http.Client{Timeout: 2 * time.Second}
++	var last error
++	for {
++		resp, err := c.Get(queryBase + "/api/v3/services")
++		if err == nil {
++			resp.Body.Close()
++			if resp.StatusCode == http.StatusOK {
++				return nil
++			}
++			err = fmt.Errorf("status %s", resp.Status)
++		}
++		last = err
++		if !time.Now().Before(deadline) {
++			return fmt.Errorf("jaeger query %s not answering: %v", queryBase, last)
++		}
++		select {
++		case <-dead:
++			return fmt.Errorf("jaeger exited before its query API answered on %s", queryBase)
++		case <-time.After(200 * time.Millisecond):
++		}
++	}
++}
++
++func jaegerPortsFree(o *jaegerOpts) error {
++	for _, p := range []int{jaegerPortThriftHTT, jaegerPortQueryHTTP, jaegerPortHealth, 4317, 4318, 14250, 16685} {
++		l, err := net.Listen("tcp", o.hostPort(p))
++		if err != nil {
++			return fmt.Errorf("jaeger port %s busy: %v (pick another -jaeger-port-offset)", o.hostPort(p), err)
++		}
++		l.Close()
++	}
++	for _, p := range []int{jaegerPortCompact, jaegerPortBinary} {
++		c, err := net.ListenPacket("udp", o.hostPort(p))
++		if err != nil {
++			return fmt.Errorf("jaeger udp port %s busy: %v (pick another -jaeger-port-offset)", o.hostPort(p), err)
++		}
++		c.Close()
++	}
++	return nil
++}
++
++// ---------------------------------------------------------------- window markers
++
++// traceMarks makes driveRoutes print window markers (set in the operator for
++// inproc, from LOADGEN_TRACE_MARKS=1 in bin/loadgen).
++var traceMarks bool
++
++const envTraceMarks = "LOADGEN_TRACE_MARKS"
++
++type traceWindow struct {
++	idx, level, wi, clients int
++	start, end              time.Time
++}
++
++func formatTraceMark(w traceWindow) string {
++	return fmt.Sprintf("window %d level %d wi %d clients %d start_us %d end_us %d\n",
++		w.idx, w.level, w.wi, w.clients, w.start.UnixMicro(), w.end.UnixMicro())
++}
++
++func parseTraceMark(line string) (traceWindow, bool) {
++	f := strings.Fields(line)
++	keys := []string{"window", "level", "wi", "clients", "start_us", "end_us"}
++	if len(f) != 2*len(keys) {
++		return traceWindow{}, false
++	}
++	var v [6]int64
++	for i, key := range keys {
++		if f[2*i] != key {
++			return traceWindow{}, false
++		}
++		n, err := strconv.ParseInt(f[2*i+1], 10, 64)
++		if err != nil {
++			return traceWindow{}, false
++		}
++		v[i] = n
++	}
++	return traceWindow{idx: int(v[0]), level: int(v[1]), wi: int(v[2]), clients: int(v[3]),
++		start: time.UnixMicro(v[4]), end: time.UnixMicro(v[5])}, true
++}
++
++// markCounter numbers the windows driveRoutes marks.
++type markCounter struct{ n int }
++
++func (m *markCounter) emit(w io.Writer, level, wi, clients int, start, end time.Time) {
++	if !traceMarks {
++		return
++	}
++	fmt.Fprint(w, formatTraceMark(traceWindow{idx: m.n, level: level, wi: wi, clients: clients, start: start, end: end}))
++	m.n++
++}
++
++// lockedWriter serialises writers sharing one stream (route lines, cp lines).
++type lockedWriter struct {
++	mu *sync.Mutex
++	w  io.Writer
++}
++
++func (l lockedWriter) Write(p []byte) (int, error) {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	return l.w.Write(p)
++}
++
++// lineSniffer copies everything to w and calls on for every complete line.
++type lineSniffer struct {
++	w   io.Writer
++	buf []byte
++	on  func(string)
++}
++
++func (s *lineSniffer) Write(p []byte) (int, error) {
++	n, err := s.w.Write(p)
++	s.buf = append(s.buf, p...)
++	for {
++		i := bytes.IndexByte(s.buf, '\n')
++		if i < 0 {
++			break
++		}
++		line := string(s.buf[:i])
++		s.buf = s.buf[i+1:]
++		if s.on != nil {
++			s.on(line)
++		}
++	}
++	return n, err
++}
++
++// ---------------------------------------------------------------- traces
++
++type traceSpan struct {
++	traceID, spanID, parentID string
++	service, name             string
++	kind                      int // OTLP: 1 internal, 2 server, 3 client, 4 producer, 5 consumer
++	start, end                int64
++}
++
++func (s *traceSpan) isClient() bool {
++	if s.kind == 3 || s.kind == 4 {
++		return true
++	}
++	n := strings.ToLower(s.name)
++	return strings.HasSuffix(n, "_client") || strings.HasSuffix(n, "client")
++}
++
++// traceModel is the app's view of its spans.
++type traceModel struct {
++	// route of a trace from its root span ("" = not a route we drive).
++	route func(root *traceSpan) string
++	// service maps a tracer service name to its Mercury program (basename).
++	service func(service string) string
++	// backend: the store daemon a span waits on (memcached port, mongod,
++	// redis-server, ...), "" when the span is not a store call.
++	backend func(s *traceSpan) string
++}
++
++func (m traceModel) owner(s *traceSpan, kids []*traceSpan) (daemon string, rpc bool) {
++	if b := m.backend(s); b != "" {
++		return b, false
++	}
++	if s.isClient() {
++		for _, k := range kids {
++			if k.service != s.service {
++				return m.service(k.service), true
++			}
++		}
++	}
++	return m.service(s.service), false
++}
++
++type v3Doc struct {
++	Result *struct {
++		ResourceSpans []struct {
++			Resource struct {
++				Attributes []struct {
++					Key   string `json:"key"`
++					Value struct {
++						StringValue string `json:"stringValue"`
++					} `json:"value"`
++				} `json:"attributes"`
++			} `json:"resource"`
++			ScopeSpans []struct {
++				Spans []struct {
++					TraceID      string          `json:"traceId"`
++					SpanID       string          `json:"spanId"`
++					ParentSpanID string          `json:"parentSpanId"`
++					Name         string          `json:"name"`
++					Kind         json.RawMessage `json:"kind"`
++					Start        json.RawMessage `json:"startTimeUnixNano"`
++					End          json.RawMessage `json:"endTimeUnixNano"`
++				} `json:"spans"`
++			} `json:"scopeSpans"`
++		} `json:"resourceSpans"`
++	} `json:"result"`
++	Error *struct {
++		HTTPCode int    `json:"httpCode"`
++		Message  string `json:"message"`
++	} `json:"error"`
++}
++
++var otlpKinds = map[string]int{"SPAN_KIND_INTERNAL": 1, "SPAN_KIND_SERVER": 2, "SPAN_KIND_CLIENT": 3, "SPAN_KIND_PRODUCER": 4, "SPAN_KIND_CONSUMER": 5}
++
++func rawInt(r json.RawMessage) int64 {
++	s := strings.Trim(strings.TrimSpace(string(r)), `"`)
++	if k, ok := otlpKinds[s]; ok {
++		return int64(k)
++	}
++	n, _ := strconv.ParseInt(s, 10, 64)
++	return n
++}
++
++// parseV3 reads a Jaeger /api/v3/traces response (one or more JSON documents)
++// into spans grouped by trace id. A "No traces found" error document is empty.
++func parseV3(r io.Reader) (map[string][]*traceSpan, error) {
++	out := map[string][]*traceSpan{}
++	dec := json.NewDecoder(r)
++	for {
++		var doc v3Doc
++		if err := dec.Decode(&doc); err == io.EOF {
++			return out, nil
++		} else if err != nil {
++			return out, err
++		}
++		if doc.Error != nil {
++			if doc.Error.HTTPCode == http.StatusNotFound {
++				continue
++			}
++			return out, fmt.Errorf("jaeger: %d %s", doc.Error.HTTPCode, doc.Error.Message)
++		}
++		if doc.Result == nil {
++			continue
++		}
++		for _, rs := range doc.Result.ResourceSpans {
++			svc := ""
++			for _, a := range rs.Resource.Attributes {
++				if a.Key == "service.name" {
++					svc = a.Value.StringValue
++				}
++			}
++			for _, ss := range rs.ScopeSpans {
++				for _, sp := range ss.Spans {
++					s := &traceSpan{traceID: sp.TraceID, spanID: sp.SpanID, parentID: sp.ParentSpanID,
++						service: svc, name: sp.Name, kind: int(rawInt(sp.Kind)), start: rawInt(sp.Start), end: rawInt(sp.End)}
++					if s.end < s.start {
++						s.end = s.start
++					}
++					out[s.traceID] = append(out[s.traceID], s)
++				}
++			}
++		}
++	}
++}
++
++// traceResult is one sampled request.
++type traceResult struct {
++	route string
++	start int64 // root start, unix ns
++	dur   int64 // root duration, ns
++	crit  map[string]int64
++	rpc   map[string]int64
++	spans map[string]int
++}
++
++// analyzeTrace computes the critical path of one trace. ok is false when the
++// root is not a route of this app.
++func analyzeTrace(spans []*traceSpan, m traceModel) (traceResult, bool) {
++	byID := make(map[string]*traceSpan, len(spans))
++	var uniq []*traceSpan
++	for _, s := range spans {
++		if _, dup := byID[s.spanID]; dup {
++			continue
++		}
++		byID[s.spanID] = s
++		uniq = append(uniq, s)
++	}
++	kids := map[string][]*traceSpan{}
++	var root *traceSpan
++	for _, s := range uniq {
++		if p, ok := byID[s.parentID]; ok && s.parentID != "" && p != s {
++			kids[s.parentID] = append(kids[s.parentID], s)
++			continue
++		}
++		if root == nil || s.start < root.start || (s.start == root.start && s.end-s.start > root.end-root.start) {
++			root = s
++		}
++	}
++	if root == nil {
++		return traceResult{}, false
++	}
++	res := traceResult{route: m.route(root), start: root.start, dur: root.end - root.start,
++		crit: map[string]int64{}, rpc: map[string]int64{}, spans: map[string]int{}}
++	if res.route == "" || res.dur <= 0 {
++		return res, false
++	}
++	for _, s := range uniq {
++		d, _ := m.owner(s, kids[s.spanID])
++		res.spans[d]++
++	}
++	visited := map[*traceSpan]bool{}
++	var walk func(s *traceSpan, lo, hi int64, depth int)
++	walk = func(s *traceSpan, lo, hi int64, depth int) {
++		a, b := max64(s.start, lo), min64(s.end, hi)
++		if b <= a || visited[s] {
++			return
++		}
++		visited[s] = true
++		ks := kids[s.spanID]
++		owner, rpc := m.owner(s, ks)
++		add := func(d int64) {
++			if d <= 0 {
++				return
++			}
++			res.crit[owner] += d
++			if rpc {
++				res.rpc[owner] += d
++			}
++		}
++		used := make([]bool, len(ks))
++		t := b
++		for depth < 512 {
++			best, bestEnd := -1, int64(0)
++			for i, k := range ks {
++				if used[i] || k.start >= t || k.end <= a {
++					continue
++				}
++				if e := min64(k.end, t); best < 0 || e > bestEnd {
++					best, bestEnd = i, e
++				}
++			}
++			if best < 0 {
++				break
++			}
++			used[best] = true
++			add(t - bestEnd)
++			k := ks[best]
++			walk(k, max64(k.start, a), bestEnd, depth+1)
++			t = max64(k.start, a)
++			if t <= a {
++				break
++			}
++		}
++		add(t - a)
++	}
++	walk(root, root.start, root.end, 0)
++	return res, true
++}
++
++func max64(a, b int64) int64 {
++	if a > b {
++		return a
++	}
++	return b
++}
++
++func min64(a, b int64) int64 {
++	if a < b {
++		return a
++	}
++	return b
++}
++
++// ---------------------------------------------------------------- aggregation
++
++var traceCSVHeader = []string{"window", "level", "wi", "clients", "start_unix_us", "end_unix_us",
++	"route", "daemon", "crit_share", "crit_share_tail", "rpc_share", "excl_ms_p50", "excl_ms_p95",
++	"excl_ms_mean", "span_count", "sample_count", "root_ms_p50", "root_ms_p95", "fetched", "truncated"}
++
++type cpRow struct {
++	route, daemon    string
++	share, tail, rpc float64
++	p50, p95, mean   float64
++	spans, samples   int
++	rootP50, rootP95 float64
++}
++
++// windowRows turns the window's sampled requests into one row per route and
++// daemon. crit_share = daemon's critical-path time / total request time over
++// the samples; crit_share_tail is the same over requests >= the route's p90;
++// rpc_share is the part of crit_share spent in client spans in front of the
++// daemon; excl_ms_* are per-request critical-path ms (0 when absent).
++func windowRows(results []traceResult) []cpRow {
++	byRoute := map[string][]traceResult{}
++	for _, r := range results {
++		byRoute[r.route] = append(byRoute[r.route], r)
++	}
++	routes := make([]string, 0, len(byRoute))
++	for r := range byRoute {
++		routes = append(routes, r)
++	}
++	sort.Strings(routes)
++	var rows []cpRow
++	for _, route := range routes {
++		rs := byRoute[route]
++		durs := make([]float64, len(rs))
++		var total int64
++		for i, r := range rs {
++			durs[i] = float64(r.dur) / 1e6
++			total += r.dur
++		}
++		p90 := quantile(durs, 0.90)
++		rootP50, rootP95 := quantile(durs, 0.50), quantile(durs, 0.95)
++		var tailTotal int64
++		for _, r := range rs {
++			if float64(r.dur)/1e6 >= p90 {
++				tailTotal += r.dur
++			}
++		}
++		daemons := map[string]bool{}
++		for _, r := range rs {
++			for d := range r.crit {
++				daemons[d] = true
++			}
++			for d := range r.spans {
++				daemons[d] = true
++			}
++		}
++		var rrows []cpRow
++		for d := range daemons {
++			row := cpRow{route: route, daemon: d, samples: len(rs), rootP50: rootP50, rootP95: rootP95}
++			excl := make([]float64, len(rs))
++			var crit, rpc, tail int64
++			for i, r := range rs {
++				crit += r.crit[d]
++				rpc += r.rpc[d]
++				if float64(r.dur)/1e6 >= p90 {
++					tail += r.crit[d]
++				}
++				excl[i] = float64(r.crit[d]) / 1e6
++				row.spans += r.spans[d]
++			}
++			if total > 0 {
++				row.share = float64(crit) / float64(total)
++				row.rpc = float64(rpc) / float64(total)
++			}
++			if tailTotal > 0 {
++				row.tail = float64(tail) / float64(tailTotal)
++			}
++			row.p50, row.p95 = quantile(excl, 0.50), quantile(excl, 0.95)
++			row.mean = float64(crit) / 1e6 / float64(len(rs))
++			rrows = append(rrows, row)
++		}
++		sort.Slice(rrows, func(i, j int) bool {
++			if rrows[i].share != rrows[j].share {
++				return rrows[i].share > rrows[j].share
++			}
++			return rrows[i].daemon < rrows[j].daemon
++		})
++		rows = append(rows, rrows...)
++	}
++	return rows
++}
++
++// quantile: nearest-rank on a copy.
++func quantile(v []float64, q float64) float64 {
++	if len(v) == 0 {
++		return 0
++	}
++	s := append([]float64(nil), v...)
++	sort.Float64s(s)
++	i := int(math.Ceil(q*float64(len(s)))) - 1
++	if i < 0 {
++		i = 0
++	}
++	if i >= len(s) {
++		i = len(s) - 1
++	}
++	return s[i]
++}
++
++func f4(v float64) string { return strconv.FormatFloat(v, 'f', 4, 64) }
++func f3(v float64) string { return strconv.FormatFloat(v, 'f', 3, 64) }
++
++// ---------------------------------------------------------------- tracer
++
++// cpTracer analyses windows asynchronously, in order, on one goroutine.
++type cpTracer struct {
++	query   string
++	model   traceModel
++	lag     time.Duration
++	depth   int
++	f       *os.File
++	csv     *csv.Writer
++	out     io.Writer // cp lines; nil = off
++	q       chan traceWindow
++	done    chan struct{}
++	client  *http.Client
++	mu      sync.Mutex
++	dropped int
++	windows int
++	failed  int
++	samples int
++	trunc   int
++	now     func() time.Time
++	sleep   func(time.Duration)
++}
++
++func newCPTracer(query string, m traceModel, csvPath string, out io.Writer, lag time.Duration, depth int) (*cpTracer, error) {
++	if err := os.MkdirAll(filepath.Dir(csvPath), 0o755); err != nil {
++		return nil, err
++	}
++	f, err := os.Create(csvPath)
++	if err != nil {
++		return nil, err
++	}
++	t := &cpTracer{query: strings.TrimRight(query, "/"), model: m, lag: lag, depth: depth, f: f, csv: csv.NewWriter(f),
++		out: out, q: make(chan traceWindow, 4096), done: make(chan struct{}),
++		client: &http.Client{Timeout: 30 * time.Second}, now: time.Now, sleep: time.Sleep}
++	if err := t.csv.Write(traceCSVHeader); err != nil {
++		f.Close()
++		return nil, err
++	}
++	t.csv.Flush()
++	go t.run()
++	return t, nil
++}
++
++// mark queues a window; it never blocks the load generator's output path.
++func (t *cpTracer) mark(w traceWindow) {
++	select {
++	case t.q <- w:
++	default:
++		t.mu.Lock()
++		t.dropped++
++		t.mu.Unlock()
++	}
++}
++
++// onLine is the lineSniffer callback.
++func (t *cpTracer) onLine(line string) {
++	if w, ok := parseTraceMark(line); ok {
++		t.mark(w)
++	}
++}
++
++// close processes what is queued (waiting out the lag of the last window) and
++// closes the CSV.
++func (t *cpTracer) close() string {
++	close(t.q)
++	<-t.done
++	t.csv.Flush()
++	t.f.Close()
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	return fmt.Sprintf("traces windows %d samples %d failed %d truncated %d dropped %d csv %s",
++		t.windows, t.samples, t.failed, t.trunc, t.dropped, t.f.Name())
++}
++
++func (t *cpTracer) run() {
++	defer close(t.done)
++	for w := range t.q {
++		if d := w.end.Add(t.lag).Sub(t.now()); d > 0 {
++			t.sleep(d)
++		}
++		if err := t.process(w); err != nil {
++			t.mu.Lock()
++			t.failed++
++			t.mu.Unlock()
++			fmt.Fprintf(os.Stderr, "traces window %d: %v\n", w.idx, err)
++		}
++	}
++}
++
++func (t *cpTracer) fetch(start, end time.Time) (map[string][]*traceSpan, error) {
++	q := url.Values{}
++	q.Set("query.startTimeMin", start.UTC().Format(time.RFC3339Nano))
++	q.Set("query.startTimeMax", end.UTC().Format(time.RFC3339Nano))
++	q.Set("query.searchDepth", strconv.Itoa(t.depth))
++	resp, err := t.client.Get(t.query + "/api/v3/traces?" + q.Encode())
++	if err != nil {
++		return nil, err
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode == http.StatusNotFound {
++		return map[string][]*traceSpan{}, nil
++	}
++	if resp.StatusCode != http.StatusOK {
++		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
++		return nil, fmt.Errorf("GET /api/v3/traces: %s %s", resp.Status, bytes.TrimSpace(body))
++	}
++	return parseV3(resp.Body)
++}
++
++func (t *cpTracer) process(w traceWindow) error {
++	traces, err := t.fetch(w.start, w.end)
++	if err != nil {
++		return err
++	}
++	lo, hi := w.start.UnixNano(), w.end.UnixNano()
++	var results []traceResult
++	for _, spans := range traces {
++		r, ok := analyzeTrace(spans, t.model)
++		if ok && r.start >= lo && r.start < hi {
++			results = append(results, r)
++		}
++	}
++	truncated := 0
++	if len(traces) >= t.depth {
++		truncated = 1
++	}
++	rows := windowRows(results)
++	for _, r := range rows {
++		rec := []string{strconv.Itoa(w.idx), strconv.Itoa(w.level), strconv.Itoa(w.wi), strconv.Itoa(w.clients),
++			strconv.FormatInt(w.start.UnixMicro(), 10), strconv.FormatInt(w.end.UnixMicro(), 10),
++			r.route, r.daemon, f4(r.share), f4(r.tail), f4(r.rpc), f3(r.p50), f3(r.p95), f3(r.mean),
++			strconv.Itoa(r.spans), strconv.Itoa(r.samples), f3(r.rootP50), f3(r.rootP95),
++			strconv.Itoa(len(traces)), strconv.Itoa(truncated)}
++		if err := t.csv.Write(rec); err != nil {
++			return err
++		}
++	}
++	t.csv.Flush()
++	if t.out != nil {
++		var b strings.Builder
++		for i := 0; i < len(rows); {
++			j := i
++			fmt.Fprintf(&b, "cp window %d clients %d route %s samples %d root_p95_ms %s", w.idx, w.clients, rows[i].route, rows[i].samples, f3(rows[i].rootP95))
++			for ; j < len(rows) && rows[j].route == rows[i].route; j++ {
++				if rows[j].share >= 0.005 {
++					fmt.Fprintf(&b, " %s=%s", rows[j].daemon, f3(rows[j].share))
++				}
++			}
++			b.WriteByte('\n')
++			i = j
++		}
++		if b.Len() > 0 {
++			io.WriteString(t.out, b.String())
++		}
++	}
++	t.mu.Lock()
++	t.windows++
++	t.samples += len(results)
++	t.trunc += truncated
++	t.mu.Unlock()
++	return t.csv.Error()
++}
+diff --git a/goperate/jaegercp_test.go b/goperate/jaegercp_test.go
+new file mode 100644
+index 0000000..4ce9651
+--- /dev/null
++++ b/goperate/jaegercp_test.go
+@@ -0,0 +1,343 @@
++package main
++
++// Tests for jaegercp.go (shared verbatim by hotel operate and social goperate).
++// testdata/jaeger-v3-hotel.json is a recorded-format Jaeger v3 /api/v3/traces
++// response with hand-built traces whose critical paths are known exactly.
++
++import (
++	"encoding/csv"
++	"math"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++)
++
++const fixtureT0 = int64(1792395000000000000) // window start of the fixtures
++
++// genericModel mirrors the hotel model so this file does not depend on the app.
++func genericModel() traceModel {
++	return traceModel{
++		route: func(root *traceSpan) string {
++			if root.service == "search" || root.service == "geo" {
++				return root.service
++			}
++			return ""
++		},
++		service: func(s string) string { return s },
++		backend: func(s *traceSpan) string {
++			switch {
++			case strings.HasPrefix(s.name, "memcached"):
++				return "11212"
++			case strings.HasPrefix(s.name, "mongo"):
++				return "mongod"
++			}
++			return ""
++		},
++	}
++}
++
++func loadFixture(t *testing.T, name string) map[string][]*traceSpan {
++	t.Helper()
++	f, err := os.Open(filepath.Join("testdata", name))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer f.Close()
++	traces, err := parseV3(f)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return traces
++}
++
++func near(a, b float64) bool { return math.Abs(a-b) < 1e-6 }
++
++func ms(ns int64) float64 { return float64(ns) / 1e6 }
++
++func TestParseV3(t *testing.T) {
++	traces := loadFixture(t, "jaeger-v3-hotel.json")
++	if len(traces) != 5 {
++		t.Fatalf("got %d traces, want 5", len(traces))
++	}
++	a := traces["0000000000000000000000000000000a"]
++	if len(a) != 6 {
++		t.Fatalf("trace a has %d spans", len(a))
++	}
++	for _, s := range a {
++		if s.spanID == "0000000000000002" {
++			if s.service != "search" || s.kind != 3 || s.parentID != "0000000000000001" || s.end-s.start != 3e6 {
++				t.Fatalf("bad span %+v", *s)
++			}
++		}
++	}
++	empty, err := parseV3(strings.NewReader(`{"error":{"httpCode":404,"message":"No traces found"}}`))
++	if err != nil || len(empty) != 0 {
++		t.Fatalf("404 doc: %v %v", empty, err)
++	}
++	if _, err := parseV3(strings.NewReader(`{"error":{"httpCode":400,"message":"bad"}}`)); err == nil {
++		t.Fatal("400 doc should fail")
++	}
++	k := rawInt([]byte(`"SPAN_KIND_CLIENT"`))
++	if k != 3 {
++		t.Fatalf("string kind %d", k)
++	}
++}
++
++func TestCriticalPathSequential(t *testing.T) {
++	traces := loadFixture(t, "jaeger-v3-hotel.json")
++	r, ok := analyzeTrace(traces["0000000000000000000000000000000a"], genericModel())
++	if !ok || r.route != "search" || r.dur != 10e6 {
++		t.Fatalf("got %+v %v", r, ok)
++	}
++	want := map[string]float64{"search": 2.5, "geo": 3, "rate": 2.5, "11212": 2}
++	var sum int64
++	for d, v := range r.crit {
++		sum += v
++		if !near(ms(v), want[d]) {
++			t.Errorf("%s crit %.3f ms, want %.3f", d, ms(v), want[d])
++		}
++	}
++	if sum != r.dur {
++		t.Errorf("crit sums to %d, want %d", sum, r.dur)
++	}
++	if !near(ms(r.rpc["geo"]), 1) || !near(ms(r.rpc["rate"]), 1) || r.rpc["search"] != 0 {
++		t.Errorf("rpc %v", r.rpc)
++	}
++	if r.spans["search"] != 1 || r.spans["geo"] != 2 || r.spans["rate"] != 2 || r.spans["11212"] != 1 {
++		t.Errorf("span counts %v", r.spans)
++	}
++}
++
++func TestCriticalPathParallel(t *testing.T) {
++	traces := loadFixture(t, "jaeger-v3-hotel.json")
++	r, ok := analyzeTrace(traces["0000000000000000000000000000000b"], genericModel())
++	if !ok {
++		t.Fatal("not analysed")
++	}
++	// rate finishes last (108) so it is on the path; geo only covers 101-102,
++	// before rate's client span starts.
++	want := map[string]float64{"search": 3, "rate": 6, "geo": 1}
++	for d, w := range want {
++		if !near(ms(r.crit[d]), w) {
++			t.Errorf("%s crit %.3f ms, want %.3f", d, ms(r.crit[d]), w)
++		}
++	}
++	if !near(ms(r.rpc["geo"]), 0.5) || !near(ms(r.rpc["rate"]), 1) {
++		t.Errorf("rpc %v", r.rpc)
++	}
++}
++
++func TestCriticalPathNonRoute(t *testing.T) {
++	traces := loadFixture(t, "jaeger-v3-hotel.json")
++	if _, ok := analyzeTrace(traces["0000000000000000000000000000000e"], genericModel()); ok {
++		t.Fatal("jaeger's own trace counted as a route")
++	}
++	// orphan child (parent missing) becomes the root; a cycle must not hang
++	cyc := []*traceSpan{
++		{spanID: "1", parentID: "2", service: "geo", start: 0, end: 10},
++		{spanID: "2", parentID: "1", service: "geo", start: 1, end: 5},
++	}
++	if _, ok := analyzeTrace(cyc, genericModel()); ok {
++		t.Fatal("cycle without root should not be analysed")
++	}
++}
++
++func TestWindowRows(t *testing.T) {
++	traces := loadFixture(t, "jaeger-v3-hotel.json")
++	var rs []traceResult
++	for _, sp := range traces {
++		if r, ok := analyzeTrace(sp, genericModel()); ok && r.start >= fixtureT0 {
++			rs = append(rs, r)
++		}
++	}
++	rows := windowRows(rs)
++	got := map[string]cpRow{}
++	for _, r := range rows {
++		got[r.route+"/"+r.daemon] = r
++	}
++	want := map[string][2]float64{ // share, rpc
++		"search/search": {0.275, 0}, "search/geo": {0.2, 0.075}, "search/rate": {0.425, 0.1},
++		"search/11212": {0.1, 0}, "geo/geo": {1, 0},
++	}
++	if len(got) != len(want) {
++		t.Fatalf("rows %v", rows)
++	}
++	for k, w := range want {
++		r, ok := got[k]
++		if !ok || !near(r.share, w[0]) || !near(r.rpc, w[1]) {
++			t.Errorf("%s: %+v, want share %.3f rpc %.3f", k, r, w[0], w[1])
++		}
++	}
++	s := got["search/search"]
++	if s.samples != 2 || !near(s.p50, 2.5) || !near(s.p95, 3) || !near(s.mean, 2.75) || !near(s.rootP95, 10) {
++		t.Errorf("search/search stats %+v", s)
++	}
++	if rows[0].route != "geo" || rows[1].daemon != "rate" {
++		t.Errorf("order: %v", rows)
++	}
++}
++
++func TestTraceMarkRoundTrip(t *testing.T) {
++	w := traceWindow{idx: 7, level: 1, wi: 3, clients: 64, start: time.UnixMicro(1792395000000000), end: time.UnixMicro(1792395001000123)}
++	got, ok := parseTraceMark(strings.TrimSpace(formatTraceMark(w)))
++	if !ok || got != w {
++		t.Fatalf("got %+v %v", got, ok)
++	}
++	for _, bad := range []string{"route search clients 1", "window 1 level 0 wi 0 clients 1 start_us x end_us 2", "window 1"} {
++		if _, ok := parseTraceMark(bad); ok {
++			t.Errorf("parsed %q", bad)
++		}
++	}
++	var b strings.Builder
++	traceMarks = false
++	var m markCounter
++	m.emit(&b, 0, 0, 1, time.Now(), time.Now())
++	if b.Len() != 0 {
++		t.Fatal("marker printed with tracing off")
++	}
++	traceMarks = true
++	defer func() { traceMarks = false }()
++	m.emit(&b, 0, 0, 1, time.Now(), time.Now())
++	m.emit(&b, 0, 1, 1, time.Now(), time.Now())
++	if !strings.HasPrefix(b.String(), "window 0 level 0 wi 0 ") || !strings.Contains(b.String(), "window 1 level 0 wi 1 ") {
++		t.Fatalf("markers %q", b.String())
++	}
++}
++
++func TestLineSniffer(t *testing.T) {
++	var out strings.Builder
++	var lines []string
++	s := &lineSniffer{w: lockedWriter{mu: &sync.Mutex{}, w: &out}, on: func(l string) { lines = append(lines, l) }}
++	for _, chunk := range []string{"route a 1\nwin", "dow 0 level", " 0\n", "tail"} {
++		s.Write([]byte(chunk))
++	}
++	if out.String() != "route a 1\nwindow 0 level 0\ntail" {
++		t.Fatalf("passthrough %q", out.String())
++	}
++	if len(lines) != 2 || lines[1] != "window 0 level 0" {
++		t.Fatalf("lines %q", lines)
++	}
++}
++
++func TestTracerAgainstFakeJaeger(t *testing.T) {
++	body, err := os.ReadFile(filepath.Join("testdata", "jaeger-v3-hotel.json"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	var mu sync.Mutex
++	var queries []string
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		mu.Lock()
++		queries = append(queries, r.URL.RawQuery)
++		mu.Unlock()
++		if r.URL.Path != "/api/v3/traces" {
++			http.NotFound(w, r)
++			return
++		}
++		if r.URL.Query().Get("query.startTimeMin") == time.Unix(0, fixtureT0).UTC().Format(time.RFC3339Nano) {
++			w.Header().Set("Content-Type", "application/json")
++			w.Write(body)
++			return
++		}
++		w.WriteHeader(http.StatusNotFound)
++		w.Write([]byte(`{"error":{"httpCode":404,"message":"No traces found"}}`))
++	}))
++	defer srv.Close()
++	dir := t.TempDir()
++	path := filepath.Join(dir, "traces.csv")
++	var cp strings.Builder
++	tr, err := newCPTracer(srv.URL, genericModel(), path, lockedWriter{mu: &sync.Mutex{}, w: &cp}, 0, 3)
++	if err != nil {
++		t.Fatal(err)
++	}
++	w0 := traceWindow{idx: 0, level: 0, wi: 0, clients: 4, start: time.Unix(0, fixtureT0), end: time.Unix(0, fixtureT0+int64(time.Second))}
++	w1 := traceWindow{idx: 1, level: 0, wi: 1, clients: 4, start: time.Unix(0, fixtureT0-int64(time.Hour)), end: time.Unix(0, fixtureT0-int64(time.Hour-time.Second))}
++	tr.onLine(strings.TrimSpace(formatTraceMark(w0)))
++	tr.onLine("route search clients 4 ...")
++	tr.onLine(strings.TrimSpace(formatTraceMark(w1)))
++	summary := tr.close()
++	if !strings.Contains(summary, "windows 2 samples 3 failed 0 truncated 1") {
++		t.Errorf("summary %q", summary)
++	}
++	f, _ := os.Open(path)
++	recs, err := csv.NewReader(f).ReadAll()
++	f.Close()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if strings.Join(recs[0], ",") != strings.Join(traceCSVHeader, ",") {
++		t.Fatalf("header %v", recs[0])
++	}
++	if len(recs) != 1+5 {
++		t.Fatalf("got %d rows: %v", len(recs)-1, recs)
++	}
++	col := map[string]int{}
++	for i, h := range recs[0] {
++		col[h] = i
++	}
++	for _, r := range recs[1:] {
++		if r[col["window"]] != "0" || r[col["clients"]] != "4" || r[col["fetched"]] != "5" || r[col["truncated"]] != "1" {
++			t.Errorf("row %v", r)
++		}
++		if r[col["route"]] == "search" && r[col["daemon"]] == "rate" {
++			if v, _ := strconv.ParseFloat(r[col["crit_share"]], 64); !near(v, 0.425) {
++				t.Errorf("rate share %v", v)
++			}
++			if r[col["sample_count"]] != "2" || r[col["span_count"]] != "4" {
++				t.Errorf("rate counts %v", r)
++			}
++		}
++	}
++	if !strings.Contains(cp.String(), "cp window 0 clients 4 route search samples 2 root_p95_ms 10.000 rate=0.425 search=0.275 geo=0.200 11212=0.100\n") {
++		t.Errorf("cp lines %q", cp.String())
++	}
++	if len(queries) != 2 || !strings.Contains(queries[0], "query.searchDepth=3") {
++		t.Errorf("queries %v", queries)
++	}
++}
++
++func TestJaegerOpts(t *testing.T) {
++	o := &jaegerOpts{on: true, mode: jaegerModeBare, cpus: "62", host: "127.0.0.1", offset: 10000,
++		sample: 0.02, transport: "http", storage: "memory", maxTraces: 200000, depth: 5000}
++	if err := o.validate(); err != nil {
++		t.Fatal(err)
++	}
++	if o.queryBase() != "http://127.0.0.1:26686" || o.collectorHTTP() != "http://127.0.0.1:24268/api/traces" || o.agentUDP() != "127.0.0.1:16831" {
++		t.Fatalf("%s %s %s", o.queryBase(), o.collectorHTTP(), o.agentUDP())
++	}
++	o.addr = "10.0.0.1:9999"
++	if o.queryBase() != "http://10.0.0.1:9999" {
++		t.Fatal(o.queryBase())
++	}
++	if got := o.csvPath("/x/run1/loadgen.out", "/out"); got != "/x/run1/traces.csv" {
++		t.Fatal(got)
++	}
++	if got := o.csvPath("", "/out"); !strings.HasPrefix(got, "/out/traces-") {
++		t.Fatal(got)
++	}
++	for _, bad := range []jaegerOpts{{on: true, mode: "x"}, {on: true, mode: jaegerModeBare, sample: 2}, {on: true, mode: jaegerModeBare, sample: 0.1, transport: "http", storage: "memory", maxTraces: 10, depth: 10, cpus: "1"}} {
++		b := bad
++		if b.validate() == nil {
++			t.Errorf("accepted %+v", b)
++		}
++	}
++	avoid := jaegerOpts{on: true, mode: jaegerModeBare, cpus: "62", host: "127.0.0.1", offset: 13863, sample: 0.02,
++		transport: "http", storage: "memory", maxTraces: 200000, depth: 5000, avoid: "8080,18180-18199"}
++	if err := avoid.validate(); err == nil || !strings.Contains(err.Error(), "port 18180") {
++		t.Errorf("offset 13863 (4317 -> 18180) not rejected: %v", err)
++	}
++	avoid.offset = 20000
++	if err := avoid.validate(); err != nil {
++		t.Errorf("offset 20000: %v", err)
++	}
++	var off *jaegerOpts
++	if off.enabled() || off.validate() != nil {
++		t.Fatal("nil opts must mean off")
++	}
++}
+diff --git a/goperate/loadgen.go b/goperate/loadgen.go
+index 8516816..78605d2 100644
+--- a/goperate/loadgen.go
++++ b/goperate/loadgen.go
+@@ -126,6 +126,7 @@ func loadgenMain(w io.Writer) error {
+ 	if id == "" {
+ 		id = loadgenID
+ 	}
++	traceMarks = os.Getenv(envTraceMarks) == "1"
+ 	gen := &genMeter{
+ 		cpus: func() string { return readCPUSet(id) },
+ 		busy: func() (time.Duration, bool) { return cgroupBusy(id) },
+@@ -243,14 +244,13 @@ func selfBusy() (time.Duration, bool) {
+ 
+ // runMercuryLoadgen starts bin/loadgen under Mercury, gives it a home CPU and
+ // the saturate policy, and copies its output to stdout until it finishes.
+-func runMercuryLoadgen(base string, maxUsers int, opts clientOpts, track func(tuple)) error {
++func runMercuryLoadgen(base string, maxUsers int, opts clientOpts, track func(tuple), w io.Writer) error {
+ 	if st, err := os.Stat(opts.bin); err != nil || st.Mode()&0o111 == 0 {
+ 		return fmt.Errorf("loadgen binary %s is missing or not executable (cd goperate && go build -o bin/loadgen .)", opts.bin)
+ 	}
+ 	out := opts.out
+ 	if out == "" {
+-		out = filepath.Join(snRoot, "output",
+-			fmt.Sprintf("loadgen-%d.out", time.Now().Unix()))
++		out = defaultGenOut()
+ 	}
+ 	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
+ 		return err
+@@ -270,6 +270,9 @@ func runMercuryLoadgen(base string, maxUsers int, opts clientOpts, track func(tu
+ 		envMax:       strconv.Itoa(opts.genMax),
+ 		"GOMAXPROCS": strconv.Itoa(opts.genProcs),
+ 	}
++	if tracing.enabled() {
++		env[envTraceMarks] = "1"
++	}
+ 	gen := tuple{path: opts.bin, hostname: "localhost", id: loadgenID}
+ 	pid, err := start(base, gen, opts.homeCPU, env)
+ 	if err != nil {
+@@ -284,7 +287,7 @@ func runMercuryLoadgen(base string, maxUsers int, opts clientOpts, track func(tu
+ 		return err
+ 	}
+ 	fmt.Printf("policy loadgen saturate min %d max %d home %d out %s\n", opts.genMin, opts.genMax, opts.homeCPU, out)
+-	return tailLoadgen(out, func() bool { return processAlive(pid) }, os.Stdout, 100*time.Millisecond)
++	return tailLoadgen(out, func() bool { return processAlive(pid) }, w, 100*time.Millisecond)
+ }
+ 
+ // tailLoadgen copies complete lines from path to w until it sees doneLine
+diff --git a/goperate/main.go b/goperate/main.go
+index ae8a936..e32b9b5 100644
+--- a/goperate/main.go
++++ b/goperate/main.go
+@@ -68,11 +68,16 @@ func main() {
+ 	svcMax := flag.Int("svc-max", autoMaxCores, "autoscale: per-service max cores")
+ 	svcFixedFlag := flag.String("svc-fixed", "", "autoscale: per-program fixed cores, e.g. geo=1,mongod=2 (min = max for those daemons)")
+ 	placement := flag.String("placement", "least_loaded", "core hand-out for /scale: least_loaded or nearest_first")
++	tracing = addJaegerFlags(root) // -jaeger*, -trace-*: see jaegercp.go and jaeger_app.go
+ 	flag.Usage = func() {
+ 		fmt.Fprintf(os.Stderr, "usage: goperate [flags] start|stop|init|autoscale\n\n")
+ 		flag.PrintDefaults()
+ 	}
+ 	flag.Parse()
++	if err := tracing.validate(); err != nil {
++		fmt.Fprintln(os.Stderr, err)
++		os.Exit(2)
++	}
+ 	if flag.NArg() != 1 {
+ 		flag.Usage()
+ 		os.Exit(2)
+@@ -126,6 +131,12 @@ func main() {
+ 		os.Exit(2)
+ 	}
+ 	connsPerRoute = *conns
++	if tracing.enabled() {
++		if *client == clientMercury && *genOut == "" {
++			*genOut = defaultGenOut()
++		}
++		tracing.out = tracing.csvPath(*genOut, socialOutputDir())
++	}
+ 	opts := clientOpts{
+ 		mode: *client, bin: *genBin, out: *genOut, config: *configPath, file: *file, graph: *graph,
+ 		routes: *routes, mix: *mix, homeCPU: *genCPU, genMin: *genMin, genMax: *genMax,
+@@ -156,6 +167,9 @@ func run(mercury string, cpu, users, initWorkers int, cmd string, opts clientOpt
+ 		return err
+ 	}
+ 	if cmd == "stop" {
++		if tracing.enabled() && tracing.mode == jaegerModeMercury {
++			_ = kill(base, "social-jaeger")
++		}
+ 		return stopAll(base, lines)
+ 	}
+ 	if cpu < 1 {
+@@ -165,6 +179,7 @@ func run(mercury string, cpu, users, initWorkers int, cmd string, opts clientOpt
+ 	var (
+ 		startedMu sync.Mutex
+ 		started   []tuple
++		jaeger    *jaegerProc
+ 	)
+ 	track := func(t tuple) {
+ 		startedMu.Lock()
+@@ -180,6 +195,7 @@ func run(mercury string, cpu, users, initWorkers int, cmd string, opts clientOpt
+ 			}
+ 		}
+ 		started = nil
++		jaeger.stop()
+ 	}
+ 	sig := make(chan os.Signal, 1)
+ 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+@@ -189,6 +205,20 @@ func run(mercury string, cpu, users, initWorkers int, cmd string, opts clientOpt
+ 		os.Exit(1)
+ 	}()
+ 
++	if tracing.enabled() {
++		if cmd == "start" && tracing.mode == jaegerModeBare {
++			fmt.Fprintln(os.Stderr, "warning: -jaeger-mode bare Jaeger stops when goperate exits; use mercury or external with start")
++		}
++		if err := prepareSocialRunDir(socialRunDir(), opts.config); err != nil {
++			return err
++		}
++		fmt.Printf("social cwd %s (config/jaeger-config.yml: probabilistic %s)\n", socialRunDir(), tracing.sampleString())
++		if jaeger, err = startJaeger(tracing, base, cpu, "social", jaegerLogPath(), track); err != nil {
++			stopStarted()
++			return err
++		}
++	}
++
+ 	for _, line := range lines {
+ 		addr, err := listenAddr(line, cfg)
+ 		if err != nil {
+@@ -201,7 +231,7 @@ func run(mercury string, cpu, users, initWorkers int, cmd string, opts clientOpt
+ 				return fmt.Errorf("%s: %w", line.id, err)
+ 			}
+ 		}
+-		env := daemonEnv(line)
++		env := addTraceEnv(line, daemonEnv(line))
+ 		pid, err := start(base, line, cpu, env)
+ 		if err != nil {
+ 			stopStarted()
+diff --git a/goperate/testdata/jaeger-v3-hotel.json b/goperate/testdata/jaeger-v3-hotel.json
+new file mode 100644
+index 0000000..33e682b
+--- /dev/null
++++ b/goperate/testdata/jaeger-v3-hotel.json
+@@ -0,0 +1,312 @@
++{
++ "result": {
++  "resourceSpans": [
++   {
++    "resource": {
++     "attributes": [
++      {
++       "key": "service.name",
++       "value": {
++        "stringValue": "search"
++       }
++      }
++     ]
++    },
++    "scopeSpans": [
++     {
++      "scope": {},
++      "spans": [
++       {
++        "traceId": "0000000000000000000000000000000a",
++        "spanId": "0000000000000001",
++        "name": "/search.Search/Nearby",
++        "kind": 2,
++        "startTimeUnixNano": "1792395000000000000",
++        "endTimeUnixNano": "1792395000010000000",
++        "status": {}
++       },
++       {
++        "traceId": "0000000000000000000000000000000a",
++        "spanId": "0000000000000002",
++        "parentSpanId": "0000000000000001",
++        "name": "/geo.Geo/Nearby",
++        "kind": 3,
++        "startTimeUnixNano": "1792395000001000000",
++        "endTimeUnixNano": "1792395000004000000",
++        "status": {}
++       },
++       {
++        "traceId": "0000000000000000000000000000000a",
++        "spanId": "0000000000000004",
++        "parentSpanId": "0000000000000001",
++        "name": "/rate.Rate/GetRates",
++        "kind": 3,
++        "startTimeUnixNano": "1792395000004500000",
++        "endTimeUnixNano": "1792395000009000000",
++        "status": {}
++       }
++      ]
++     }
++    ]
++   },
++   {
++    "resource": {
++     "attributes": [
++      {
++       "key": "service.name",
++       "value": {
++        "stringValue": "geo"
++       }
++      }
++     ]
++    },
++    "scopeSpans": [
++     {
++      "scope": {},
++      "spans": [
++       {
++        "traceId": "0000000000000000000000000000000a",
++        "spanId": "0000000000000003",
++        "parentSpanId": "0000000000000002",
++        "name": "/geo.Geo/Nearby",
++        "kind": 2,
++        "startTimeUnixNano": "1792395000001500000",
++        "endTimeUnixNano": "1792395000003500000",
++        "status": {}
++       }
++      ]
++     }
++    ]
++   },
++   {
++    "resource": {
++     "attributes": [
++      {
++       "key": "service.name",
++       "value": {
++        "stringValue": "rate"
++       }
++      }
++     ]
++    },
++    "scopeSpans": [
++     {
++      "scope": {},
++      "spans": [
++       {
++        "traceId": "0000000000000000000000000000000a",
++        "spanId": "0000000000000005",
++        "parentSpanId": "0000000000000004",
++        "name": "/rate.Rate/GetRates",
++        "kind": 2,
++        "startTimeUnixNano": "1792395000005000000",
++        "endTimeUnixNano": "1792395000008500000",
++        "status": {}
++       },
++       {
++        "traceId": "0000000000000000000000000000000a",
++        "spanId": "0000000000000006",
++        "parentSpanId": "0000000000000005",
++        "name": "memcached_get_multi_rate",
++        "kind": 1,
++        "startTimeUnixNano": "1792395000005500000",
++        "endTimeUnixNano": "1792395000007500000",
++        "status": {}
++       }
++      ]
++     }
++    ]
++   },
++   {
++    "resource": {
++     "attributes": [
++      {
++       "key": "service.name",
++       "value": {
++        "stringValue": "search"
++       }
++      }
++     ]
++    },
++    "scopeSpans": [
++     {
++      "scope": {},
++      "spans": [
++       {
++        "traceId": "0000000000000000000000000000000b",
++        "spanId": "0000000000000001",
++        "name": "/search.Search/Nearby",
++        "kind": 2,
++        "startTimeUnixNano": "1792395000100000000",
++        "endTimeUnixNano": "1792395000110000000",
++        "status": {}
++       },
++       {
++        "traceId": "0000000000000000000000000000000b",
++        "spanId": "0000000000000002",
++        "parentSpanId": "0000000000000001",
++        "name": "/geo.Geo/Nearby",
++        "kind": 3,
++        "startTimeUnixNano": "1792395000101000000",
++        "endTimeUnixNano": "1792395000106000000",
++        "status": {}
++       },
++       {
++        "traceId": "0000000000000000000000000000000b",
++        "spanId": "0000000000000004",
++        "parentSpanId": "0000000000000001",
++        "name": "/rate.Rate/GetRates",
++        "kind": 3,
++        "startTimeUnixNano": "1792395000102000000",
++        "endTimeUnixNano": "1792395000108000000",
++        "status": {}
++       }
++      ]
++     }
++    ]
++   },
++   {
++    "resource": {
++     "attributes": [
++      {
++       "key": "service.name",
++       "value": {
++        "stringValue": "geo"
++       }
++      }
++     ]
++    },
++    "scopeSpans": [
++     {
++      "scope": {},
++      "spans": [
++       {
++        "traceId": "0000000000000000000000000000000b",
++        "spanId": "0000000000000003",
++        "parentSpanId": "0000000000000002",
++        "name": "/geo.Geo/Nearby",
++        "kind": 2,
++        "startTimeUnixNano": "1792395000101500000",
++        "endTimeUnixNano": "1792395000105500000",
++        "status": {}
++       }
++      ]
++     }
++    ]
++   },
++   {
++    "resource": {
++     "attributes": [
++      {
++       "key": "service.name",
++       "value": {
++        "stringValue": "rate"
++       }
++      }
++     ]
++    },
++    "scopeSpans": [
++     {
++      "scope": {},
++      "spans": [
++       {
++        "traceId": "0000000000000000000000000000000b",
++        "spanId": "0000000000000005",
++        "parentSpanId": "0000000000000004",
++        "name": "/rate.Rate/GetRates",
++        "kind": 2,
++        "startTimeUnixNano": "1792395000102500000",
++        "endTimeUnixNano": "1792395000107500000",
++        "status": {}
++       }
++      ]
++     }
++    ]
++   },
++   {
++    "resource": {
++     "attributes": [
++      {
++       "key": "service.name",
++       "value": {
++        "stringValue": "geo"
++       }
++      }
++     ]
++    },
++    "scopeSpans": [
++     {
++      "scope": {},
++      "spans": [
++       {
++        "traceId": "0000000000000000000000000000000c",
++        "spanId": "0000000000000001",
++        "name": "/geo.Geo/Nearby",
++        "kind": 2,
++        "startTimeUnixNano": "1792395000200000000",
++        "endTimeUnixNano": "1792395000202000000",
++        "status": {}
++       }
++      ]
++     }
++    ]
++   },
++   {
++    "resource": {
++     "attributes": [
++      {
++       "key": "service.name",
++       "value": {
++        "stringValue": "search"
++       }
++      }
++     ]
++    },
++    "scopeSpans": [
++     {
++      "scope": {},
++      "spans": [
++       {
++        "traceId": "0000000000000000000000000000000d",
++        "spanId": "0000000000000001",
++        "name": "/search.Search/Nearby",
++        "kind": 2,
++        "startTimeUnixNano": "1792394999995000000",
++        "endTimeUnixNano": "1792395000005000000",
++        "status": {}
++       }
++      ]
++     }
++    ]
++   },
++   {
++    "resource": {
++     "attributes": [
++      {
++       "key": "service.name",
++       "value": {
++        "stringValue": "jaeger"
++       }
++      }
++     ]
++    },
++    "scopeSpans": [
++     {
++      "scope": {},
++      "spans": [
++       {
++        "traceId": "0000000000000000000000000000000e",
++        "spanId": "0000000000000001",
++        "name": "/api/v3/traces",
++        "kind": 2,
++        "startTimeUnixNano": "1792395000300000000",
++        "endTimeUnixNano": "1792395000301000000",
++        "status": {}
++       }
++      ]
++     }
++    ]
++   }
++  ]
++ }
++}
+\ No newline at end of file
+diff --git a/goperate/testdata/jaeger-v3-social.json b/goperate/testdata/jaeger-v3-social.json
+new file mode 100644
+index 0000000..99d578d
+--- /dev/null
++++ b/goperate/testdata/jaeger-v3-social.json
+@@ -0,0 +1,355 @@
++{
++ "result": {
++  "resourceSpans": [
++   {
++    "resource": {
++     "attributes": [
++      {
++       "key": "service.name",
++       "value": {
++        "stringValue": "compose-post-service"
++       }
++      }
++     ]
++    },
++    "scopeSpans": [
++     {
++      "scope": {},
++      "spans": [
++       {
++        "traceId": "00000000000000000000000000000051",
++        "spanId": "0000000000000001",
++        "name": "compose_post_server",
++        "kind": 1,
++        "startTimeUnixNano": "1792395000000000000",
++        "endTimeUnixNano": "1792395000020000000",
++        "status": {}
++       },
++       {
++        "traceId": "00000000000000000000000000000051",
++        "spanId": "0000000000000002",
++        "parentSpanId": "0000000000000001",
++        "name": "compose_text_client",
++        "kind": 1,
++        "startTimeUnixNano": "1792395000001000000",
++        "endTimeUnixNano": "1792395000006000000",
++        "status": {}
++       },
++       {
++        "traceId": "00000000000000000000000000000051",
++        "spanId": "0000000000000007",
++        "parentSpanId": "0000000000000001",
++        "name": "store_post_client",
++        "kind": 1,
++        "startTimeUnixNano": "1792395000007000000",
++        "endTimeUnixNano": "1792395000012000000",
++        "status": {}
++       },
++       {
++        "traceId": "00000000000000000000000000000051",
++        "spanId": "000000000000000a",
++        "parentSpanId": "0000000000000001",
++        "name": "write_home_timeline_client",
++        "kind": 1,
++        "startTimeUnixNano": "1792395000013000000",
++        "endTimeUnixNano": "1792395000015000000",
++        "status": {}
++       }
++      ]
++     }
++    ]
++   },
++   {
++    "resource": {
++     "attributes": [
++      {
++       "key": "service.name",
++       "value": {
++        "stringValue": "text-service"
++       }
++      }
++     ]
++    },
++    "scopeSpans": [
++     {
++      "scope": {},
++      "spans": [
++       {
++        "traceId": "00000000000000000000000000000051",
++        "spanId": "0000000000000003",
++        "parentSpanId": "0000000000000002",
++        "name": "compose_text_server",
++        "kind": 1,
++        "startTimeUnixNano": "1792395000001500000",
++        "endTimeUnixNano": "1792395000005500000",
++        "status": {}
++       },
++       {
++        "traceId": "00000000000000000000000000000051",
++        "spanId": "0000000000000004",
++        "parentSpanId": "0000000000000003",
++        "name": "compose_urls_client",
++        "kind": 1,
++        "startTimeUnixNano": "1792395000002000000",
++        "endTimeUnixNano": "1792395000004000000",
++        "status": {}
++       }
++      ]
++     }
++    ]
++   },
++   {
++    "resource": {
++     "attributes": [
++      {
++       "key": "service.name",
++       "value": {
++        "stringValue": "url-shorten-service"
++       }
++      }
++     ]
++    },
++    "scopeSpans": [
++     {
++      "scope": {},
++      "spans": [
++       {
++        "traceId": "00000000000000000000000000000051",
++        "spanId": "0000000000000005",
++        "parentSpanId": "0000000000000004",
++        "name": "compose_urls_server",
++        "kind": 1,
++        "startTimeUnixNano": "1792395000002200000",
++        "endTimeUnixNano": "1792395000003800000",
++        "status": {}
++       },
++       {
++        "traceId": "00000000000000000000000000000051",
++        "spanId": "0000000000000006",
++        "parentSpanId": "0000000000000005",
++        "name": "url_mongo_insert_client",
++        "kind": 1,
++        "startTimeUnixNano": "1792395000002500000",
++        "endTimeUnixNano": "1792395000003500000",
++        "status": {}
++       }
++      ]
++     }
++    ]
++   },
++   {
++    "resource": {
++     "attributes": [
++      {
++       "key": "service.name",
++       "value": {
++        "stringValue": "post-storage-service"
++       }
++      }
++     ]
++    },
++    "scopeSpans": [
++     {
++      "scope": {},
++      "spans": [
++       {
++        "traceId": "00000000000000000000000000000051",
++        "spanId": "0000000000000008",
++        "parentSpanId": "0000000000000007",
++        "name": "store_post_server",
++        "kind": 1,
++        "startTimeUnixNano": "1792395000007500000",
++        "endTimeUnixNano": "1792395000011500000",
++        "status": {}
++       },
++       {
++        "traceId": "00000000000000000000000000000051",
++        "spanId": "0000000000000009",
++        "parentSpanId": "0000000000000008",
++        "name": "post_storage_mongo_insert_client",
++        "kind": 1,
++        "startTimeUnixNano": "1792395000008000000",
++        "endTimeUnixNano": "1792395000011000000",
++        "status": {}
++       }
++      ]
++     }
++    ]
++   },
++   {
++    "resource": {
++     "attributes": [
++      {
++       "key": "service.name",
++       "value": {
++        "stringValue": "write-home-timeline-service"
++       }
++      }
++     ]
++    },
++    "scopeSpans": [
++     {
++      "scope": {},
++      "spans": [
++       {
++        "traceId": "00000000000000000000000000000051",
++        "spanId": "000000000000000b",
++        "parentSpanId": "000000000000000a",
++        "name": "write_home_timeline_server",
++        "kind": 1,
++        "startTimeUnixNano": "1792395000016000000",
++        "endTimeUnixNano": "1792395000030000000",
++        "status": {}
++       },
++       {
++        "traceId": "00000000000000000000000000000051",
++        "spanId": "000000000000000c",
++        "parentSpanId": "000000000000000b",
++        "name": "write_home_timeline_redis_update_client",
++        "kind": 1,
++        "startTimeUnixNano": "1792395000017000000",
++        "endTimeUnixNano": "1792395000020000000",
++        "status": {}
++       }
++      ]
++     }
++    ]
++   },
++   {
++    "resource": {
++     "attributes": [
++      {
++       "key": "service.name",
++       "value": {
++        "stringValue": "home-timeline-service"
++       }
++      }
++     ]
++    },
++    "scopeSpans": [
++     {
++      "scope": {},
++      "spans": [
++       {
++        "traceId": "00000000000000000000000000000052",
++        "spanId": "0000000000000001",
++        "name": "read_home_timeline_server",
++        "kind": 1,
++        "startTimeUnixNano": "1792395000050000000",
++        "endTimeUnixNano": "1792395000054000000",
++        "status": {}
++       },
++       {
++        "traceId": "00000000000000000000000000000052",
++        "spanId": "0000000000000002",
++        "parentSpanId": "0000000000000001",
++        "name": "read_home_timeline_redis_find_client",
++        "kind": 1,
++        "startTimeUnixNano": "1792395000050500000",
++        "endTimeUnixNano": "1792395000051500000",
++        "status": {}
++       },
++       {
++        "traceId": "00000000000000000000000000000052",
++        "spanId": "0000000000000003",
++        "parentSpanId": "0000000000000001",
++        "name": "read_posts_client",
++        "kind": 1,
++        "startTimeUnixNano": "1792395000051500000",
++        "endTimeUnixNano": "1792395000053500000",
++        "status": {}
++       }
++      ]
++     }
++    ]
++   },
++   {
++    "resource": {
++     "attributes": [
++      {
++       "key": "service.name",
++       "value": {
++        "stringValue": "post-storage-service"
++       }
++      }
++     ]
++    },
++    "scopeSpans": [
++     {
++      "scope": {},
++      "spans": [
++       {
++        "traceId": "00000000000000000000000000000052",
++        "spanId": "0000000000000004",
++        "parentSpanId": "0000000000000003",
++        "name": "post_storage_read_posts_server",
++        "kind": 1,
++        "startTimeUnixNano": "1792395000051700000",
++        "endTimeUnixNano": "1792395000053300000",
++        "status": {}
++       },
++       {
++        "traceId": "00000000000000000000000000000052",
++        "spanId": "0000000000000005",
++        "parentSpanId": "0000000000000004",
++        "name": "post_storage_mmc_mget_client",
++        "kind": 1,
++        "startTimeUnixNano": "1792395000052000000",
++        "endTimeUnixNano": "1792395000053000000",
++        "status": {}
++       }
++      ]
++     }
++    ]
++   },
++   {
++    "resource": {
++     "attributes": [
++      {
++       "key": "service.name",
++       "value": {
++        "stringValue": "user-service"
++       }
++      }
++     ]
++    },
++    "scopeSpans": [
++     {
++      "scope": {},
++      "spans": [
++       {
++        "traceId": "00000000000000000000000000000053",
++        "spanId": "0000000000000001",
++        "name": "login_server",
++        "kind": 1,
++        "startTimeUnixNano": "1792395000060000000",
++        "endTimeUnixNano": "1792395000063000000",
++        "status": {}
++       },
++       {
++        "traceId": "00000000000000000000000000000053",
++        "spanId": "0000000000000002",
++        "parentSpanId": "0000000000000001",
++        "name": "user_mmc_get_client",
++        "kind": 1,
++        "startTimeUnixNano": "1792395000060500000",
++        "endTimeUnixNano": "1792395000061000000",
++        "status": {}
++       },
++       {
++        "traceId": "00000000000000000000000000000053",
++        "spanId": "0000000000000003",
++        "parentSpanId": "0000000000000001",
++        "name": "user_mongo_find_client",
++        "kind": 1,
++        "startTimeUnixNano": "1792395000061000000",
++        "endTimeUnixNano": "1792395000062500000",
++        "status": {}
++       }
++      ]
++     }
++    ]
++   }
++  ]
++ }
++}
+\ No newline at end of file
+diff --git a/run/launch b/run/launch
+index 7a7a1e9..edb3daf 100755
+--- a/run/launch
++++ b/run/launch
+@@ -1,7 +1,10 @@
+ #!/bin/sh
+ # Mercury keeps its own working directory. The services open
+-# config/jaeger-config.yml and config/service-config.json relative to this tree.
+-root=/home/paul/Benchmarks/deathstar-socialNetwork
++# config/jaeger-config.yml and config/service-config.json relative to their
++# working directory: this tree, or SOCIAL_RUNDIR when set (goperate -jaeger
++# writes a per-run config/ there with the requested trace sampling).
++# The tree is found from this script's path (Mercury execs it by absolute path).
++root=$(cd "$(dirname "$0")/.." && pwd)
+ name=$(basename "$0")
+-cd "$root" || exit 1
++cd "${SOCIAL_RUNDIR:-$root}" || exit 1
+ exec "$root/bin/$name" "$@"
