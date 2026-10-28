@@ -90,6 +90,9 @@ func listenAddr(line tuple, cfg serviceConfig) (string, error) {
 	}
 	switch base {
 	case "mongod":
+		if addr, err := cfg.address("social-graph-mongodb"); err == nil {
+			return addr, nil // -config may move MongoDB (demo: 27018 next to hotel's 27017)
+		}
 		return "127.0.0.1:27017", nil
 	case "redis-server":
 		return "127.0.0.1:6379", nil
@@ -241,6 +244,37 @@ func waitPort(addr string, timeout time.Duration) error {
 	return fmt.Errorf("timed out: %v", last)
 }
 
+// waitRedis sends PING until Redis answers +PONG (not -LOADING or another error) or timeout passes.
+func waitRedis(addr string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	last := "no reply"
+	for time.Now().Before(deadline) {
+		c, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err == nil {
+			_ = c.SetDeadline(time.Now().Add(time.Second))
+			buf := make([]byte, 256)
+			if _, err = c.Write([]byte("PING\r\n")); err == nil {
+				var n int
+				n, err = c.Read(buf)
+				reply := strings.TrimSpace(string(buf[:n]))
+				if err == nil && strings.HasPrefix(reply, "+PONG") {
+					c.Close()
+					return nil
+				}
+				if reply != "" {
+					last = reply
+				}
+			}
+			c.Close()
+		}
+		if err != nil {
+			last = err.Error()
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return fmt.Errorf("timed out after %s: %s", timeout, last)
+}
+
 func processAlive(pid int) bool {
 	_, err := os.Stat("/proc/" + strconv.Itoa(pid))
 	return err == nil
@@ -272,12 +306,33 @@ func rampClients(maxUsers int) []int {
 	return clients
 }
 func enableSaturate(base, id string, minCores, maxCores int) error {
-	status, body, err := post(base, "/scale", map[string]any{
+	return enableScale(base, id, "saturate", minCores, maxCores)
+}
+
+// Policy for the service daemons (-policy, -tick-ms, -placement). The load generator stays on saturate.
+var (
+	servicePolicy    = "saturate"
+	serviceTickMs    = 10
+	servicePlacement = "least_loaded"
+	servicePin       = true              // -pin: gnn pins busy threads (false: cpuset sizing only)
+	saturateOnly     = map[string]bool{} // program base names kept on saturate under -policy gnn
+)
+
+// enableScale attaches policy (saturate or gnn) to a daemon with the -placement core hand-out.
+// tick_ms is sent for gnn only.
+func enableScale(base, id, policy string, minCores, maxCores int) error {
+	req := map[string]any{
 		"daemon_id": id,
-		"policy":    "saturate",
+		"policy":    policy,
 		"min":       minCores,
 		"max":       maxCores,
-	})
+		"placement": servicePlacement,
+	}
+	if policy == "gnn" {
+		req["tick_ms"] = serviceTickMs
+		req["pin"] = servicePin
+	}
+	status, body, err := post(base, "/scale", req)
 	if err != nil {
 		return err
 	}
@@ -287,7 +342,7 @@ func enableSaturate(base, id string, minCores, maxCores int) error {
 	return nil
 }
 func readCPUSet(id string) string {
-	data, err := os.ReadFile("/sys/fs/cgroup/mercury/" + id + "/cpuset.cpus")
+	data, err := os.ReadFile(cgroupFile(id, "cpuset.cpus"))
 	if err != nil {
 		return "?"
 	}
@@ -348,6 +403,7 @@ type reading struct {
 	serviceRate uint64
 	avgUs       float64
 	p95Us       float64
+	p99Us       float64
 	errors      uint64
 }
 
@@ -362,6 +418,7 @@ func readWindow(before, after snap, elapsed time.Duration) reading {
 		serviceRate: perSecond(d.done, elapsed),
 		avgUs:       avg / float64(time.Microsecond),
 		p95Us:       float64(d.percentile(0.95)) / float64(time.Microsecond),
+		p99Us:       float64(d.percentile(0.99)) / float64(time.Microsecond),
 		errors:      d.errs,
 	}
 }

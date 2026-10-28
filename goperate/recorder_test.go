@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -147,4 +150,84 @@ func TestTailLoadgen(t *testing.T) {
 
 func writeFile(path, text string) error {
 	return os.WriteFile(path, []byte(text), 0o644)
+}
+
+func TestPoissonRate(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	rec := startPoisson(ctx, func(context.Context, int) error { return nil }, 1000, time.Second, 1)
+	rec.setLevel(2000)
+	time.Sleep(50 * time.Millisecond)
+	before := rec.snapshot()
+	time.Sleep(time.Second)
+	d := rec.snapshot().sub(before)
+	cancel()
+	rec.wg.Wait()
+	if d.sent < 1700 || d.sent > 2300 || d.errs != 0 {
+		t.Fatalf("2000/s for 1 s: sent %d errs %d", d.sent, d.errs)
+	}
+}
+
+// Latency counts from the scheduled arrival; arrivals beyond the in-flight cap count as errors.
+func TestPoissonLatencyAndCap(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	slow := func(c context.Context, _ int) error {
+		select {
+		case <-time.After(20 * time.Millisecond):
+		case <-c.Done():
+		}
+		return nil
+	}
+	rec := startPoisson(ctx, slow, 1000, time.Second, 2)
+	rec.setLevel(100)
+	time.Sleep(500 * time.Millisecond)
+	s := rec.snapshot()
+	if s.done == 0 || s.percentile(0.5) < uint64(20*time.Millisecond) {
+		t.Fatalf("p50 %v below the 20 ms the call takes", time.Duration(s.percentile(0.5)))
+	}
+	cancel()
+	rec.wg.Wait()
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	block := func(c context.Context, _ int) error { <-c.Done(); return c.Err() }
+	capped := startPoisson(ctx2, block, 5, 10*time.Second, 3)
+	capped.setLevel(400)
+	time.Sleep(300 * time.Millisecond)
+	c := capped.snapshot()
+	cancel2()
+	capped.wg.Wait()
+	if c.sent < 60 || c.errs < c.sent-5 {
+		t.Fatalf("cap 5: sent %d errs %d (want errs >= sent - 5)", c.sent, c.errs)
+	}
+}
+
+// Requests in flight hold distinct worker numbers below the cap (per-worker state is never shared).
+func TestPoissonSlots(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var mu sync.Mutex
+	busy := map[int]bool{}
+	bad := ""
+	call := func(c context.Context, w int) error {
+		mu.Lock()
+		if w < 0 || w >= 8 || busy[w] {
+			bad = fmt.Sprintf("worker %d out of range or already in flight", w)
+		}
+		busy[w] = true
+		mu.Unlock()
+		time.Sleep(5 * time.Millisecond)
+		mu.Lock()
+		busy[w] = false
+		mu.Unlock()
+		return nil
+	}
+	rec := startPoisson(ctx, call, 8, time.Second, 4)
+	rec.setLevel(3000)
+	time.Sleep(300 * time.Millisecond)
+	cancel()
+	rec.wg.Wait()
+	if bad != "" {
+		t.Fatal(bad)
+	}
+	if s := rec.snapshot(); s.done == 0 {
+		t.Fatal("nothing served")
+	}
 }

@@ -14,6 +14,7 @@
 
 #include "../../gen-cpp/SocialGraphService.h"
 #include "../../gen-cpp/UserService.h"
+#include "../MercuryPolicy.h"
 #include "../ClientPool.h"
 #include "../ThriftClient.h"
 #include "../logger.h"
@@ -103,6 +104,7 @@ bool SocialGraphHandler::IsRedisReplicationEnabled() {
 void SocialGraphHandler::Follow(
     int64_t req_id, int64_t user_id, int64_t followee_id,
     const std::map<std::string, std::string> &carrier) {
+  MercuryPolicy::Get().Check("follow");
   // Initialize a span
   TextMapReader reader(carrier);
   std::map<std::string, std::string> writer_text_map;
@@ -303,6 +305,7 @@ void SocialGraphHandler::Follow(
 void SocialGraphHandler::Unfollow(
     int64_t req_id, int64_t user_id, int64_t followee_id,
     const std::map<std::string, std::string> &carrier) {
+  MercuryPolicy::Get().Check("follow");
   // Initialize a span
   TextMapReader reader(carrier);
   std::map<std::string, std::string> writer_text_map;
@@ -829,6 +832,7 @@ void SocialGraphHandler::FollowWithUsername(
     int64_t req_id, const std::string &user_name,
     const std::string &followee_name,
     const std::map<std::string, std::string> &carrier) {
+  MercuryPolicy::Get().Check("follow");
   // Initialize a span
   TextMapReader reader(carrier);
   std::map<std::string, std::string> writer_text_map;
@@ -903,6 +907,7 @@ void SocialGraphHandler::UnfollowWithUsername(
     int64_t req_id, const std::string &user_name,
     const std::string &followee_name,
     const std::map<std::string, std::string> &carrier) {
+  MercuryPolicy::Get().Check("follow");
   // Initialize a span
   TextMapReader reader(carrier);
   std::map<std::string, std::string> writer_text_map;

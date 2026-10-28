@@ -17,17 +17,19 @@ import (
 // Environment read by bin/loadgen. Mercury execs a daemon with no arguments,
 // so everything the generator needs arrives here.
 const (
-	envRole   = "OPERATE_ROLE"   // "loadgen" selects runLoadgen in main
-	envUsers  = "LOADGEN_USERS"  // maximum users per route
-	envOut    = "LOADGEN_OUT"    // output file, one fsynced line per write
-	envID     = "LOADGEN_ID"     // this daemon's Mercury id, for its own cgroup
-	envConfig = "SOCIAL_CONFIG"  // service-config.json path
-	envGraph  = "LOADGEN_GRAPH"  // social graph .edges file (user ids)
-	envRoutes = "LOADGEN_ROUTES" // comma-separated routes
-	envMix    = "LOADGEN_MIX"    // route weights, e.g. compose-post=0.1,...
-	envConns  = "LOADGEN_CONNS"  // gRPC connections per route (0 = one per worker)
-	envFile   = "LOADGEN_FILE"   // deployment list, for the cpus column
-	envMax    = "LOADGEN_MAX"    // saturate max, for gen_bound
+	envRole   = "OPERATE_ROLE"      // "loadgen" selects runLoadgen in main
+	envUsers  = "LOADGEN_USERS"     // maximum users per route
+	envOut    = "LOADGEN_OUT"       // output file, one fsynced line per write
+	envID     = "LOADGEN_ID"        // this daemon's Mercury id, for its own cgroup
+	envConfig = "SOCIAL_CONFIG"     // service-config.json path
+	envGraph  = "LOADGEN_GRAPH"     // social graph .edges file (user ids)
+	envRoutes = "LOADGEN_ROUTES"    // comma-separated routes
+	envMix    = "LOADGEN_MIX"       // route weights, e.g. compose-post=0.1,...
+	envConns  = "LOADGEN_CONNS"     // gRPC connections per route (0 = one per worker)
+	envWindow = "LOADGEN_WINDOW_MS" // measurement window per autoscale reading
+	envFile   = "LOADGEN_FILE"      // deployment list, for the cpus column
+	envMax    = "LOADGEN_MAX"       // saturate max, for gen_bound
+	envHist   = "LOADGEN_HIST"      // per-window latency histogram file (-hist); empty = off
 	roleGen   = "loadgen"
 	doneLine  = "loadgen done"
 	errorLine = "loadgen error"
@@ -69,6 +71,13 @@ func loadgenMain(w io.Writer) error {
 	users, err := strconv.Atoi(os.Getenv(envUsers))
 	if err != nil || users < 1 {
 		return fmt.Errorf("%s must be a positive integer, got %q", envUsers, os.Getenv(envUsers))
+	}
+	if v := os.Getenv(envWindow); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 100 {
+			return fmt.Errorf("bad %s %q", envWindow, v)
+		}
+		windowMs = n
 	}
 	if v := os.Getenv(envConns); v != "" {
 		n, err := strconv.Atoi(v)
@@ -117,6 +126,20 @@ func loadgenMain(w io.Writer) error {
 	id := os.Getenv(envID)
 	if id == "" {
 		id = loadgenID
+	}
+	if p := os.Getenv(envHist); p != "" {
+		hf, err := os.OpenFile(p, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+		if err != nil {
+			return err
+		}
+		defer hf.Close()
+		histOut = hf
+	}
+	traceMarks = os.Getenv(envTraceMarks) == "1"
+	if v := os.Getenv(envLoad); v != "" {
+		if err := demoLoad.decode(v); err != nil {
+			return err
+		}
 	}
 	gen := &genMeter{
 		cpus: func() string { return readCPUSet(id) },
@@ -199,7 +222,7 @@ func countCPUs(spec string) int {
 
 // cgroupBusy is usage_usec from the daemon's cgroup cpu.stat.
 func cgroupBusy(id string) (time.Duration, bool) {
-	data, err := os.ReadFile("/sys/fs/cgroup/mercury/" + id + "/cpu.stat")
+	data, err := os.ReadFile(cgroupFile(id, "cpu.stat"))
 	if err != nil {
 		return 0, false
 	}
@@ -235,14 +258,13 @@ func selfBusy() (time.Duration, bool) {
 
 // runMercuryLoadgen starts bin/loadgen under Mercury, gives it a home CPU and
 // the saturate policy, and copies its output to stdout until it finishes.
-func runMercuryLoadgen(base string, maxUsers int, opts clientOpts, track func(tuple)) error {
+func runMercuryLoadgen(base string, maxUsers int, opts clientOpts, track func(tuple), w io.Writer) error {
 	if st, err := os.Stat(opts.bin); err != nil || st.Mode()&0o111 == 0 {
 		return fmt.Errorf("loadgen binary %s is missing or not executable (cd goperate && go build -o bin/loadgen .)", opts.bin)
 	}
 	out := opts.out
 	if out == "" {
-		out = filepath.Join(socialRoot(), "output",
-			fmt.Sprintf("loadgen-%d.out", time.Now().Unix()))
+		out = defaultGenOut()
 	}
 	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
 		return err
@@ -254,12 +276,26 @@ func runMercuryLoadgen(base string, maxUsers int, opts clientOpts, track func(tu
 		envID:        loadgenID,
 		envConfig:    opts.config,
 		envConns:     strconv.Itoa(opts.conns),
+		envWindow:    strconv.Itoa(windowMs),
 		envFile:      opts.file,
 		envGraph:     opts.graph,
 		envRoutes:    opts.routes,
 		envMix:       opts.mix,
 		envMax:       strconv.Itoa(opts.genMax),
+		envHist:      histPath,
 		"GOMAXPROCS": strconv.Itoa(opts.genProcs),
+	}
+	if tracing.enabled() {
+		env[envTraceMarks] = "1"
+	}
+	if demoLoad.needsEnv() {
+		env[envLoad] = demoLoad.encode()
+	}
+	if v := os.Getenv(envCgroupRoot); v != "" {
+		env[envCgroupRoot] = v
+	}
+	if v := os.Getenv("DSB_ROOT"); v != "" {
+		env["DSB_ROOT"] = v // Mercury passes only explicit env: the loadgen needs the same root
 	}
 	gen := tuple{path: opts.bin, hostname: "localhost", id: loadgenID}
 	pid, err := start(base, gen, opts.homeCPU, env)
@@ -275,7 +311,7 @@ func runMercuryLoadgen(base string, maxUsers int, opts clientOpts, track func(tu
 		return err
 	}
 	fmt.Printf("policy loadgen saturate min %d max %d home %d out %s\n", opts.genMin, opts.genMax, opts.homeCPU, out)
-	return tailLoadgen(out, func() bool { return processAlive(pid) }, os.Stdout, 100*time.Millisecond)
+	return tailLoadgen(out, func() bool { return processAlive(pid) }, w, 100*time.Millisecond)
 }
 
 // tailLoadgen copies complete lines from path to w until it sees doneLine
@@ -329,3 +365,6 @@ func tailLoadgen(path string, alive func() bool, w io.Writer, poll time.Duration
 		time.Sleep(poll)
 	}
 }
+
+// histPath is the -hist file (<gen-out without .out>.hist.jsonl), empty when -hist is off.
+var histPath string

@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"math"
 	"math/bits"
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -60,6 +62,11 @@ type recorder struct {
 	active  atomic.Int32
 	shards  []shard
 	lastErr atomic.Value
+	// Open loop (startPoisson): arrivals per second (float64 bits), the free in-flight slots, a request counter.
+	poisson bool
+	rate    atomic.Uint64
+	slots   chan int
+	seq     atomic.Int64
 }
 
 func newRecorder() *recorder {
@@ -70,6 +77,15 @@ func newRecorder() *recorder {
 
 func (r *recorder) shard(worker int) *shard {
 	return &r.shards[worker%len(r.shards)]
+}
+
+// setLevel applies one schedule level: the number of active workers (closed loop) or arrivals per second (open loop).
+func (r *recorder) setLevel(v int) {
+	if r.poisson {
+		r.rate.Store(math.Float64bits(float64(v)))
+		return
+	}
+	r.setActive(int32(v))
 }
 
 func (r *recorder) setActive(n int32) {
@@ -189,5 +205,74 @@ func startLoad(ctx context.Context, call func(context.Context, int) error, worke
 			}
 		}(worker)
 	}
+	return rec
+}
+
+// startPoisson drives call open-loop: arrivals form a Poisson process (exponential gaps, mean 1/rate) at the rate set
+// with setLevel, independent of earlier requests finishing. Each request's latency counts from its scheduled arrival,
+// so a backlog in the client is latency, not hidden. At most inflight requests run at once; an arrival that finds no
+// slot, a timeout and an error all count in errs. A request holds one slot 0..inflight-1 until it finishes and gets
+// it as its worker number, so per-worker state (sized inflight) is never used by two requests at once.
+func startPoisson(ctx context.Context, call func(context.Context, int) error, inflight int, timeout time.Duration, seed int64) *recorder {
+	rec := newRecorder()
+	rec.poisson = true
+	rec.slots = make(chan int, inflight)
+	for i := 0; i < inflight; i++ {
+		rec.slots <- i
+	}
+	rng := rand.New(rand.NewSource(seed))
+	launch := func(sched time.Time) {
+		sh := rec.shard(int(rec.seq.Add(1)))
+		sh.sent.Add(1)
+		var w int
+		select {
+		case w = <-rec.slots:
+		default:
+			sh.errs.Add(1)
+			rec.lastErr.Store("in-flight cap reached")
+			return
+		}
+		rec.wg.Add(1)
+		go func() {
+			defer rec.wg.Done()
+			defer func() { rec.slots <- w }()
+			cctx, cancel := context.WithTimeout(ctx, timeout)
+			err := call(cctx, w)
+			cancel()
+			if ctx.Err() != nil {
+				return
+			}
+			if err != nil {
+				sh.errs.Add(1)
+				rec.lastErr.Store(err.Error())
+				return
+			}
+			sh.add(uint64(time.Since(sched)))
+		}()
+	}
+	rec.wg.Add(1)
+	go func() {
+		defer rec.wg.Done()
+		next := time.Now()
+		for ctx.Err() == nil {
+			rate := math.Float64frombits(rec.rate.Load())
+			now := time.Now()
+			if rate <= 0 {
+				next = now
+				time.Sleep(5 * time.Millisecond)
+				continue
+			}
+			if now.Sub(next) > time.Second {
+				next = now // the dispatcher itself stalled (or the rate just went up from 0): do not burst
+			}
+			for !next.After(now) {
+				launch(next)
+				next = next.Add(time.Duration(rng.ExpFloat64() / rate * float64(time.Second)))
+			}
+			if d := next.Sub(now); d > 0 {
+				time.Sleep(d)
+			}
+		}
+	}()
 	return rec
 }

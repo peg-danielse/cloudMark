@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/apache/thrift/lib/go/thrift"
+	"golang.org/x/sys/unix"
 	sn "socialnetwork/goperate/social_network"
 )
 
@@ -242,6 +244,20 @@ type connSet struct {
 
 func newConnSet(addr string, workers int) (*connSet, error) {
 	cs := &connSet{addr: addr}
+	if demoLoad.poisson() {
+		// Open loop: request numbers keep growing, so no per-worker slots; a pool of -inflight connections, dialled
+		// on first use (one now, to fail fast), so only the in-flight cap limits concurrency.
+		c, err := dialThrift(addr)
+		if err != nil {
+			return nil, err
+		}
+		cs.pool = make(chan *tconn, demoLoad.inflight)
+		cs.pool <- c
+		for i := 1; i < demoLoad.inflight; i++ {
+			cs.pool <- nil
+		}
+		return cs, nil
+	}
 	if connsPerRoute <= 0 || connsPerRoute >= workers {
 		cs.perWork = true
 		cs.own = make([]*tconn, workers)
@@ -502,12 +518,21 @@ func openRoutes(cfg serviceConfig, names []string, maxUsers int, w *workload) ([
 	for _, name := range names {
 		weight := w.mix[name]
 		workers := routeUsers(maxUsers, weight)
+		if demoLoad.poisson() {
+			workers = demoLoad.inflight // per-worker state for each in-flight slot (startPoisson's worker numbers)
+		}
 		work, err := openLoad(cfg, name, workers, w)
 		if err != nil {
 			return routes, err
 		}
 		ctx, cancel := context.WithCancel(context.Background())
-		rec := startLoad(ctx, work.call, workers, 1)
+		var rec *recorder
+		if demoLoad.poisson() {
+			rec = startPoisson(ctx, work.call, demoLoad.inflight, demoLoad.timeout(), routeSeed(name))
+			rec.setLevel(readyRate) // until the schedule starts
+		} else {
+			rec = startLoad(ctx, work.call, workers, 1)
+		}
 		routes = append(routes, liveRoute{name: name, weight: weight, work: work, rec: rec, cancel: cancel})
 		if err := waitReady(rec, name); err != nil {
 			return routes, err
@@ -532,26 +557,89 @@ func stopRoutes(routes []liveRoute) {
 	}
 }
 
-func measureRoutes(routes []liveRoute) []reading {
+// windowMs is the autoscale measurement window (-window-ms, LOADGEN_WINDOW_MS); default 1 s.
+var windowMs = 1000
+
+// measureRoutes returns one reading per route for a window, the per-route counter deltas of that
+// window (for -hist), and the window's CLOCK_MONOTONIC bounds (the clock of threadtrace).
+func measureRoutes(routes []liveRoute) ([]reading, []snap, int64, int64) {
 	befores := make([]snap, len(routes))
 	for i, route := range routes {
 		befores[i] = route.rec.snapshot()
 	}
+	m0 := monoNs()
 	began := time.Now()
-	time.Sleep(scaleMeasure)
+	time.Sleep(time.Duration(windowMs) * time.Millisecond)
 	elapsed := time.Since(began)
+	m1 := monoNs()
 	out := make([]reading, len(routes))
+	diffs := make([]snap, len(routes))
 	for i, route := range routes {
-		out[i] = readWindow(befores[i], route.rec.snapshot(), elapsed)
+		after := route.rec.snapshot()
+		out[i] = readWindow(befores[i], after, elapsed)
+		diffs[i] = after.sub(befores[i])
 	}
-	return out
+	return out, diffs, m0, m1
+}
+
+// histOut receives one JSON line per route per window when -hist is on (LOADGEN_HIST in the load generator):
+// the window's monotonic bounds, counts, and every non-empty latency bucket as [upper_ns, count].
+var histOut io.Writer
+
+func writeHist(routes []liveRoute, diffs []snap, level, window int, clients func(liveRoute) int, m0, m1 int64) {
+	if histOut == nil {
+		return
+	}
+	for i, route := range routes {
+		d := diffs[i]
+		var b strings.Builder
+		fmt.Fprintf(&b, `{"route":%q,"level":%d,"window":%d,"clients":%d,"t0_ns":%d,"t1_ns":%d,"sent":%d,"done":%d,"errors":%d,"hist":[`,
+			route.name, level, window, clients(route), m0, m1, d.sent, d.done, d.errs)
+		first := true
+		for k, c := range d.hist {
+			if c == 0 {
+				continue
+			}
+			if !first {
+				b.WriteByte(',')
+			}
+			first = false
+			fmt.Fprintf(&b, "[%d,%d]", bucketUpper(k), c)
+		}
+		b.WriteString("]}\n")
+		io.WriteString(histOut, b.String())
+	}
+}
+
+func monoNs() int64 {
+	var ts unix.Timespec
+	if unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts) != nil {
+		return 0
+	}
+	return ts.Nano()
+}
+
+// readyRate (req/s) probes a route under -arrivals poisson until the schedule sets its first level.
+const readyRate = 20
+
+// routeSeed gives each route its own reproducible Poisson arrival sequence.
+func routeSeed(name string) int64 {
+	h := int64(1469598103934665603)
+	for _, c := range name {
+		h = (h ^ int64(c)) * 1099511628211
+	}
+	return h
 }
 
 func waitReady(rec *recorder, name string) error {
 	deadline := time.Now().Add(10 * time.Second)
+	hard := time.Now().Add(120 * time.Second) // a backend answering LOADING (Redis) extends the wait up to this
 	for time.Now().Before(deadline) {
 		if rec.snapshot().done > 0 {
 			return nil
+		}
+		if text, ok := rec.lastErr.Load().(string); ok && strings.Contains(text, "LOADING") && time.Now().Add(time.Second).After(deadline) && deadline.Before(hard) {
+			deadline = deadline.Add(time.Second)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}

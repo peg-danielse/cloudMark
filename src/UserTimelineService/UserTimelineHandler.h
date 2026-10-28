@@ -12,6 +12,7 @@
 #include "../../gen-cpp/PostStorageService.h"
 #include "../../gen-cpp/UserTimelineService.h"
 #include "../ClientPool.h"
+#include "../MercuryPolicy.h"
 #include "../ThriftClient.h"
 #include "../logger.h"
 #include "../tracing.h"
@@ -186,6 +187,7 @@ void UserTimelineHandler::WriteUserTimeline(
 void UserTimelineHandler::ReadUserTimeline(
     std::vector<Post> &_return, int64_t req_id, int64_t user_id, int start,
     int stop, const std::map<std::string, std::string> &carrier) {
+  MercuryPolicy::Get().Check("read-user-timeline");
   // Initialize a span
   TextMapReader reader(carrier);
   std::map<std::string, std::string> writer_text_map;
