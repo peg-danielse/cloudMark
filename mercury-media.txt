@@ -1,0 +1,25 @@
+# Media deployment for mediaoperate (-file): exec_path hostname, one program per line, in start order.
+# Paths are relative to benchmarks/. The stores come first, then the services; run/ holds the wrappers and the
+# standalone config (scripts/standalone_config.py writes it).
+deathstar-mediaMicroservices/run/mongod Apollo
+deathstar-mediaMicroservices/run/11300 Apollo
+deathstar-mediaMicroservices/run/11301 Apollo
+deathstar-mediaMicroservices/run/11302 Apollo
+deathstar-mediaMicroservices/run/11303 Apollo
+deathstar-mediaMicroservices/run/11304 Apollo
+deathstar-mediaMicroservices/run/11305 Apollo
+deathstar-mediaMicroservices/run/11306 Apollo
+deathstar-mediaMicroservices/run/redis-server Apollo
+deathstar-mediaMicroservices/run/CastInfoService Apollo
+deathstar-mediaMicroservices/run/ComposeReviewService Apollo
+deathstar-mediaMicroservices/run/MovieIdService Apollo
+deathstar-mediaMicroservices/run/MovieInfoService Apollo
+deathstar-mediaMicroservices/run/MovieReviewService Apollo
+deathstar-mediaMicroservices/run/PageService Apollo
+deathstar-mediaMicroservices/run/PlotService Apollo
+deathstar-mediaMicroservices/run/RatingService Apollo
+deathstar-mediaMicroservices/run/ReviewStorageService Apollo
+deathstar-mediaMicroservices/run/TextService Apollo
+deathstar-mediaMicroservices/run/UniqueIdService Apollo
+deathstar-mediaMicroservices/run/UserReviewService Apollo
+deathstar-mediaMicroservices/run/UserService Apollo
