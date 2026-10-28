@@ -12,8 +12,9 @@ package main
 //            route; an arrival beyond it is an error.
 //
 // -mix sets each route's share of a level (weight 1 is the full level; the default is 1 for every route). Each level is
-// held for -step and measured in -window windows. Every window writes one "route" line per route to the output and one
-// JSON line per route to the histogram file (-hist), in the format the analysis reads.
+// held for -step and measured in -window windows. With -duration the list repeats until that time, and the last step is
+// shortened to fit. Every window writes one "route" line per route to the output and one JSON line per route to the
+// histogram file (-hist), in the format the analysis reads.
 
 import (
 	"context"
@@ -44,6 +45,7 @@ type loadOpts struct {
 	mix      map[string]float64 // weight per route, 1 = the full level
 	levels   []int
 	step     time.Duration
+	duration time.Duration // 0: play levels once; otherwise repeat them until this elapses
 	window   time.Duration
 	timeout  time.Duration
 	inflight int
@@ -60,6 +62,7 @@ const (
 	envMix      = "LOADGEN_MIX"
 	envLevels   = "LOADGEN_LEVELS"
 	envStepMs   = "LOADGEN_STEP_MS"
+	envDuration = "LOADGEN_DURATION_MS" // 0 or unset: play -levels once
 	envWindowMs = "LOADGEN_WINDOW_MS"
 	envTimeout  = "LOADGEN_TIMEOUT_MS"
 	envInflight = "LOADGEN_INFLIGHT"
@@ -89,6 +92,7 @@ func (o loadOpts) env() map[string]string {
 		envMix:      strings.Join(mix, ","),
 		envLevels:   strings.Join(levels, ","),
 		envStepMs:   strconv.FormatInt(o.step.Milliseconds(), 10),
+		envDuration: strconv.FormatInt(o.duration.Milliseconds(), 10),
 		envWindowMs: strconv.FormatInt(o.window.Milliseconds(), 10),
 		envTimeout:  strconv.FormatInt(o.timeout.Milliseconds(), 10),
 		envInflight: strconv.Itoa(o.inflight),
@@ -128,6 +132,13 @@ func optsFromEnv() (loadOpts, error) {
 	if o.step, err = ms(envStepMs); err != nil {
 		return o, err
 	}
+	if v := os.Getenv(envDuration); v != "" && v != "0" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 0 {
+			return o, fmt.Errorf("bad %s %q", envDuration, v)
+		}
+		o.duration = time.Duration(n) * time.Millisecond
+	}
 	if o.window, err = ms(envWindowMs); err != nil {
 		return o, err
 	}
@@ -166,6 +177,9 @@ func (o loadOpts) check() error {
 	}
 	if o.window <= 0 || o.step < o.window {
 		return fmt.Errorf("need 0 < window <= step, got window %v step %v", o.window, o.step)
+	}
+	if o.duration < 0 || (o.duration > 0 && o.duration < o.step) {
+		return fmt.Errorf("duration %s is shorter than one step %s", o.duration, o.step)
 	}
 	if o.inflight < 1 {
 		return fmt.Errorf("inflight must be at least 1")
@@ -340,15 +354,27 @@ func driveLoad(w io.Writer, hist io.Writer, o loadOpts) error {
 	if len(runs) == 0 {
 		return fmt.Errorf("every route has weight 0")
 	}
-	fmt.Fprintf(w, "loadgen start id=%s pid=%d arrivals=%s routes=%s levels=%v step=%v window=%v timeout=%v inflight=%d users=%d movies=%d\n",
-		o.id, os.Getpid(), o.arrivals, o.routes, o.levels, o.step, o.window, o.timeout, o.inflight, o.users, len(movies))
+	fmt.Fprintf(w, "loadgen start id=%s pid=%d arrivals=%s routes=%s levels=%v step=%v duration=%v window=%v timeout=%v inflight=%d users=%d movies=%d\n",
+		o.id, os.Getpid(), o.arrivals, o.routes, o.levels, o.step, o.duration, o.window, o.timeout, o.inflight, o.users, len(movies))
 
-	perLevel := int(o.step / o.window)
-	for li, level := range o.levels {
-		for _, r := range runs {
-			setTarget(r.rec, o.arrivals, float64(level)*r.weight)
+	next := listSchedule(o.levels, o.step, o.duration, time.Now)
+	for {
+		st, ok := next()
+		if !ok {
+			break
 		}
-		for win := 0; win < perLevel; win++ {
+		for _, r := range runs {
+			setTarget(r.rec, o.arrivals, float64(st.level)*r.weight)
+		}
+		windows := int(st.hold / o.window)
+		if windows < 1 {
+			windows = 1
+		}
+		levelStart := time.Now()
+		for win := 0; win < windows; win++ {
+			if o.duration > 0 && win > 0 && time.Since(levelStart) >= st.hold {
+				break
+			}
 			befores := make([]snap, len(runs))
 			for i, r := range runs {
 				befores[i] = r.rec.snapshot()
@@ -360,13 +386,48 @@ func driveLoad(w io.Writer, hist io.Writer, o loadOpts) error {
 			m1 := monoNs()
 			for i, r := range runs {
 				diff := r.rec.snapshot().sub(befores[i])
-				target := float64(level) * r.weight
-				writeWindow(w, r.name, li, win, target, o.arrivals, elapsed, diff, lastError(r.rec))
-				writeHist(hist, r.name, li, win, target, m0, m1, diff)
+				target := float64(st.level) * r.weight
+				writeWindow(w, r.name, st.index, win, target, o.arrivals, elapsed, diff, lastError(r.rec))
+				writeHist(hist, r.name, st.index, win, target, m0, m1, diff)
 			}
 		}
 	}
 	return nil
+}
+
+// listStep is one hold of one level. index counts from the start of the run, so a repeated level has a new index.
+type listStep struct {
+	level, index int
+	hold         time.Duration
+}
+
+// listSchedule walks levels once when duration is 0. Otherwise it repeats them until duration from the first call,
+// and the last hold is shortened to what remains.
+func listSchedule(levels []int, step, duration time.Duration, now func() time.Time) func() (listStep, bool) {
+	start := now()
+	i, n := 0, len(levels)
+	return func() (listStep, bool) {
+		if n == 0 {
+			return listStep{}, false
+		}
+		elapsed := now().Sub(start)
+		if duration > 0 {
+			if elapsed >= duration {
+				return listStep{}, false
+			}
+		} else if i >= n {
+			return listStep{}, false
+		}
+		hold := step
+		if duration > 0 {
+			if left := duration - elapsed; left < hold {
+				hold = left
+			}
+		}
+		s := listStep{level: levels[i%n], index: i, hold: hold}
+		i++
+		return s, true
+	}
 }
 
 // setTarget applies one level to a route: arrivals per second (poisson) or active users (closed).

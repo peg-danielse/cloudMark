@@ -81,8 +81,9 @@ func main() {
 	flag.Bool("hist", true, "accepted for the harness; the histograms are always written")
 	arrivals := flag.String("arrivals", arrPoisson, "poisson (open loop, levels are req/s) or closed (levels are users)")
 	load := flag.String("load", "list", "load shape: list (-levels, each held for -step); the only shape the media benchmark has")
-	levels := flag.String("levels", "50", "comma-separated levels, each held for -step")
+	levels := flag.String("levels", "50", "comma-separated levels, each held for -step; with -duration, repeated until it elapses")
 	step := flag.Duration("step", 10*time.Second, "time per level")
+	duration := flag.Duration("duration", 0, "repeat -levels until this elapses (0 = play the list once); the last step is shortened to fit")
 	windowMs := flag.Int("window-ms", 1000, "measurement window in ms")
 	timeout := flag.Duration("req-timeout", 0, "per-request timeout, counted as an error (0: 2s poisson, 10s closed)")
 	inflight := flag.Int("inflight", 4096, "poisson: requests in flight per route; an arrival beyond it counts as an error")
@@ -163,7 +164,7 @@ func main() {
 		}
 	}
 	loadOpt := loadOpts{
-		arrivals: *arrivals, routes: names, mix: mixWeights, levels: lv, step: *step,
+		arrivals: *arrivals, routes: names, mix: mixWeights, levels: lv, step: *step, duration: *duration,
 		window: time.Duration(*windowMs) * time.Millisecond, timeout: *timeout,
 		inflight: *inflight, seed: *seed, users: *users, config: *config, movies: *movies,
 	}

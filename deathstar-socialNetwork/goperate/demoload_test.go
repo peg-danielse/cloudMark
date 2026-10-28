@@ -303,6 +303,33 @@ func TestLoadV2RoundTrip(t *testing.T) {
 	if len(got) != 3 || got[0] != 250 {
 		t.Fatalf("levels %v", got)
 	}
+	cycled := &loadOpts{mode: loadList, arrivals: arrPoisson, levelList: "100,120,150", step: 100 * time.Second, duration: 350 * time.Second, inflight: 1}
+	if err := cycled.validate(500); err != nil {
+		t.Fatal(err)
+	}
+	clock := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+	cycle := cycled.levels(1, 500, clock.now)
+	var seq []int
+	var holds []time.Duration
+	for {
+		l, ok := cycle()
+		if !ok {
+			break
+		}
+		seq = append(seq, l.clients)
+		holds = append(holds, l.hold)
+		clock.t = clock.t.Add(l.hold)
+	}
+	if len(seq) != 4 || seq[0] != 100 || seq[1] != 120 || seq[2] != 150 || seq[3] != 100 {
+		t.Fatalf("cycle %v", seq)
+	}
+	if holds[3] != 50*time.Second {
+		t.Fatalf("last hold %s", holds[3])
+	}
+	short := &loadOpts{mode: loadList, arrivals: arrPoisson, levelList: "100,120", step: 100 * time.Second, duration: 50 * time.Second, inflight: 1}
+	if short.validate(500) == nil {
+		t.Fatal("duration shorter than a step accepted")
+	}
 	bad := &loadOpts{mode: loadRamp, arrivals: arrPoisson, inflight: 1}
 	if bad.validate(500) == nil {
 		t.Fatal("poisson ramp accepted")

@@ -108,13 +108,13 @@ func addLoadFlags(app string) *loadOpts {
 	flag.DurationVar(&o.period, "period", 10*time.Minute, "-load sine: sine period")
 	flag.Float64Var(&o.phase, "phase", 0, "-load sine: phase in degrees (0 = midpoint rising, 90 = max, 180 = midpoint falling, 270 = min)")
 	flag.DurationVar(&o.step, "step", 5*time.Second, "-load sine: how often the user count changes (>= -window-ms)")
-	flag.DurationVar(&o.duration, "duration", 0, "-load sine: total load time including -ramp-in (0 = ramp-in + one period)")
+	flag.DurationVar(&o.duration, "duration", 0, "-load sine: total load time including -ramp-in (0 = ramp-in + one period); -load list: repeat -levels until this elapses (0 = play the list once)")
 	flag.DurationVar(&o.rampIn, "ramp-in", 0, "-load sine: ramp linearly from 1 user to the sine over this long")
 	flag.Int64Var(&o.epochMs, "sine-epoch-ms", 0, "-load sine: unix ms of phase 0; give two operators the same value so their phases line up (0 = when the load starts)")
 	flag.StringVar(&o.csv, "load-csv", "", "per-route per-window CSV (default with -load sine: <gen-out stem>.windows.csv; - = off)")
 	flag.StringVar(&o.status, "status-file", "", "rewrite this file with the latest window summary (speculator --status)")
 	flag.StringVar(&o.arrivals, "arrivals", arrClosed, "closed (N users, each sends when its last request returns) or poisson (open loop: Poisson arrivals; levels are req/s per route)")
-	flag.StringVar(&o.levelList, "levels", "", "-load list: comma-separated levels (users, or req/s with -arrivals poisson), each held for -step")
+	flag.StringVar(&o.levelList, "levels", "", "-load list: comma-separated levels (users, or req/s with -arrivals poisson), each held for -step; with -duration, repeated until it elapses")
 	flag.IntVar(&o.rateMin, "rate-min", 0, "-load sine -arrivals poisson: lowest req/s per route (instead of -users-min)")
 	flag.IntVar(&o.rateMax, "rate-max", 0, "-load sine -arrivals poisson: highest req/s per route (instead of -users-max)")
 	flag.IntVar(&o.inflight, "inflight", 4096, "-arrivals poisson: requests in flight per route; an arrival beyond it counts as an error")
@@ -153,6 +153,9 @@ func (o *loadOpts) validate(windowMs int) error {
 		}
 		if o.step < time.Duration(windowMs)*time.Millisecond {
 			return fmt.Errorf("-step %s is shorter than -window-ms %d", o.step, windowMs)
+		}
+		if o.duration < 0 || (o.duration > 0 && o.duration < o.step) {
+			return errors.New("-duration is shorter than one -step")
 		}
 		return nil
 	}
@@ -228,6 +231,13 @@ func (o *loadOpts) usersAt(elapsed, sinceEpoch time.Duration) int {
 }
 
 func (o *loadOpts) describe() string {
+	if o.mode == loadList {
+		lv := make([]string, len(o.levelVals))
+		for i, v := range o.levelVals {
+			lv[i] = strconv.Itoa(v)
+		}
+		return fmt.Sprintf("load list levels %s step %s duration %s", strings.Join(lv, ","), o.step, o.duration)
+	}
 	if !o.sine() {
 		return "load ramp"
 	}
@@ -337,12 +347,30 @@ func (o *loadOpts) levels(maxUsers, windowMs int, now func() time.Time) func() (
 		if per < 1 {
 			per = 1
 		}
+		n := len(o.levelVals)
+		start := now()
 		i := 0
+		// -duration repeats the list until that time, shortening the last step. Without it the list plays once,
+		// which is what a single level held for the whole run relies on.
 		return func() (loadLevel, bool) {
-			if i >= len(o.levelVals) {
+			if n == 0 {
 				return loadLevel{}, false
 			}
-			l := loadLevel{level: i, clients: o.levelVals[i], windows: per, hold: o.step}
+			elapsed := now().Sub(start)
+			if o.duration > 0 {
+				if elapsed >= o.duration {
+					return loadLevel{}, false
+				}
+			} else if i >= n {
+				return loadLevel{}, false
+			}
+			hold := o.step
+			if o.duration > 0 {
+				if left := o.duration - elapsed; left < hold {
+					hold = left
+				}
+			}
+			l := loadLevel{level: i, clients: o.levelVals[i%n], windows: per, hold: hold}
 			i++
 			return l, true
 		}
