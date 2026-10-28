@@ -314,6 +314,10 @@ type loadLevel struct {
 	level, clients, windows int
 	elapsed                 time.Duration
 	sine                    bool
+	// hold: when set, the level lasts this long by the clock instead of windows windows. -load list sets it to
+	// -step: the bookkeeping between windows grows with the number of routes (about 60 ms each on dtn-01), so with
+	// seven routes 1320 windows of 500 ms took 1205 s instead of 660 s.
+	hold time.Duration
 }
 
 // suffix ends each route line of a sine level; ramp lines keep their old format.
@@ -338,7 +342,7 @@ func (o *loadOpts) levels(maxUsers, windowMs int, now func() time.Time) func() (
 			if i >= len(o.levelVals) {
 				return loadLevel{}, false
 			}
-			l := loadLevel{level: i, clients: o.levelVals[i], windows: per}
+			l := loadLevel{level: i, clients: o.levelVals[i], windows: per, hold: o.step}
 			i++
 			return l, true
 		}

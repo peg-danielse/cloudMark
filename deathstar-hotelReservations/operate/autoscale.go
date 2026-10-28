@@ -154,11 +154,16 @@ func driveRoutes(cfg boot.Config, maxUsers int, w io.Writer, lines []tuple, gen 
 		if !ok {
 			break
 		}
-		level, clients := lv.level, lv.clients
-		for _, route := range routes {
-			route.rec.setLevel(clients)
-		}
-		for window := 0; window < lv.windows; window++ {
+		level, base := lv.level, lv.clients
+		clients, scale := base, 0.0
+		levelStart := time.Now()
+		for window := 0; lv.hold > 0 && time.Since(levelStart) < lv.hold || lv.hold == 0 && window < lv.windows; window++ {
+			if s := loadScale(); s != scale { // an application-load antagonist scales the level (loadScale)
+				scale, clients = s, scaled(base, s)
+				for _, route := range routes {
+					route.rec.setLevel(clients)
+				}
+			}
 			g0 := gen.begin()
 			t0 := time.Now()
 			readings, diffs, m0, m1 := measureRoutes(routes)
@@ -176,6 +181,32 @@ func driveRoutes(cfg boot.Config, maxUsers int, w io.Writer, lines []tuple, gen 
 		}
 	}
 	return nil
+}
+
+// loadScale is the factor of an application-load antagonist (Mercury's src/test/interfere.py, kind load): the number
+// in loadgen.scale next to the -hist file, read at every window, so a phase takes effect within one window. 1 when
+// the file is missing or not a positive number; the hist and route lines report the scaled level.
+func loadScale() float64 {
+	hist := os.Getenv(envHist)
+	if hist == "" {
+		return 1
+	}
+	b, err := os.ReadFile(filepath.Join(filepath.Dir(hist), "loadgen.scale"))
+	if err != nil {
+		return 1
+	}
+	s, err := strconv.ParseFloat(strings.TrimSpace(string(b)), 64)
+	if err != nil || s <= 0 {
+		return 1
+	}
+	return s
+}
+
+func scaled(level int, s float64) int {
+	if v := int(float64(level)*s + 0.5); v > 1 {
+		return v
+	}
+	return 1
 }
 
 type liveRoute struct {

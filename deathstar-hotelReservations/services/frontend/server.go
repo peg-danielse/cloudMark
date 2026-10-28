@@ -44,6 +44,8 @@ type Server struct {
 	Port   int
 	Tracer opentracing.Tracer
 	// Registry   *registry.Client
+
+	degrade *degrade // optional-route shedding, set by Run from MERCURY_POLICY (degrade.go)
 }
 
 // Run the server
@@ -90,16 +92,17 @@ func (s *Server) Run() error {
 	log.Info().Msg("Successful")
 
 	log.Trace().Msg("frontend before mux")
+	s.degrade = startDegrade()
 	mux := tracing.NewServeMux(s.Tracer)
 	mux.Handle("/", http.FileServer(http.FS(staticContent)))
-	mux.Handle("/hotels", http.HandlerFunc(s.searchHandler))
-	mux.Handle("/recommendations", http.HandlerFunc(s.recommendHandler))
-	mux.Handle("/user", http.HandlerFunc(s.userHandler))
-	mux.Handle("/review", http.HandlerFunc(s.reviewHandler))
-	mux.Handle("/restaurants", http.HandlerFunc(s.restaurantHandler))
-	mux.Handle("/museums", http.HandlerFunc(s.museumHandler))
-	mux.Handle("/cinema", http.HandlerFunc(s.cinemaHandler))
-	mux.Handle("/reservation", http.HandlerFunc(s.reservationHandler))
+	mux.Handle("/hotels", s.degrade.wrap("hotels", http.HandlerFunc(s.searchHandler)))
+	mux.Handle("/recommendations", s.degrade.wrap("recommendations", http.HandlerFunc(s.recommendHandler)))
+	mux.Handle("/user", s.degrade.wrap("user", http.HandlerFunc(s.userHandler)))
+	mux.Handle("/review", s.degrade.wrap("review", http.HandlerFunc(s.reviewHandler)))
+	mux.Handle("/restaurants", s.degrade.wrap("restaurants", http.HandlerFunc(s.restaurantHandler)))
+	mux.Handle("/museums", s.degrade.wrap("museums", http.HandlerFunc(s.museumHandler)))
+	mux.Handle("/cinema", s.degrade.wrap("cinema", http.HandlerFunc(s.cinemaHandler)))
+	mux.Handle("/reservation", s.degrade.wrap("reservation", http.HandlerFunc(s.reservationHandler)))
 
 	log.Trace().Msg("frontend starts serving")
 
